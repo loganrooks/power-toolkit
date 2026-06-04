@@ -21,7 +21,9 @@ BLUEUTIL=$(command -v blueutil || true)
 SLEEPWATCHER=$(command -v sleepwatcher || true)
 
 # Color only on an interactive terminal; honor NO_COLOR. Keeps pipes/logs clean.
-if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != dumb ]]; then USE_COLOR=1; else USE_COLOR=0; fi
+if [[ -n "${CLICOLOR_FORCE:-}" ]]; then USE_COLOR=1
+elif [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != dumb ]]; then USE_COLOR=1
+else USE_COLOR=0; fi
 c_green(){ (( USE_COLOR )) && print -P "%F{green}$1%f" || print -- "$1"; }
 c_red(){   (( USE_COLOR )) && print -P "%F{red}$1%f"   || print -- "$1"; }
 c_dim(){   (( USE_COLOR )) && print -P "%F{8}$1%f"     || print -- "$1"; }
@@ -213,6 +215,7 @@ cmd_doctor() {
   [[ -n "$BLUEUTIL" ]] && chk "Bluetooth controllable" 'blueutil -p >/dev/null 2>&1' "grant Bluetooth: System Settings > Privacy & Security > Bluetooth"
   local hot=$(unexpected_runaway)
   [[ -n "$hot" ]] && c_dim "  · note: $hot is hot this instant (only alerts if sustained ~${SUSTAIN_MIN}m)"
+  c_dim "  · privacy: Bluetooth(blueutil)=needed · Input Monitoring(sleepwatcher)=safe to deny"
   bar; print -- "  $ok ok, $warn need attention"
 }
 

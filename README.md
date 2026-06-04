@@ -81,6 +81,8 @@ export PATH="$HOME/bin:$PATH"
 
 ### `pm status` output
 
+![pm status — battery gauge, agent health, and pmset drift at a glance](docs/pm-status.svg)
+
 ```
 ────────────────────────────────────────────
   power-toolkit  ·  mode: balanced
@@ -162,6 +164,14 @@ The launchd label prefix defaults to `local.powertoolkit` and can be overridden 
 ---
 
 ## Permissions & caveats
+
+power-toolkit drives two Homebrew CLI tools, so the entries that show up in **System Settings → Privacy & Security** are named after those tools. (A custom app name + icon would require shipping a signed `.app` — out of scope for a CLI utility.)
+
+| Entry | Created by | Needed? |
+|---|---|---|
+| **Bluetooth** | `blueutil` | **Yes** — required for the Bluetooth saver to toggle the radio. |
+| **Input Monitoring** | `sleepwatcher` | **No** — safe to deny. It's only for sleepwatcher's idle-detection feature, which this tool does not use; sleep/wake hooks work regardless. |
+| **Notifications** (shown as *Script Editor*) | `osascript` | Optional — watchdog alerts are sent via `osascript`, so they appear under "Script Editor". |
 
 **Bluetooth permission** — `blueutil` requires the macOS Bluetooth permission to toggle the radio. Grant it in System Settings > Privacy & Security > Bluetooth. Without it, the Bluetooth saver is a no-op and `pm doctor` will flag the check.
 
