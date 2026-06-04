@@ -9,6 +9,17 @@ Unified energy + computation management for macOS. One config file drives everyt
 
 ---
 
+## Quick start
+
+```sh
+git clone https://github.com/loganrooks/power-toolkit && cd power-toolkit
+./install.sh     # installs deps (blueutil, sleepwatcher), symlinks `pm` to ~/bin, applies config
+pm status        # dashboard
+pm doctor        # health check
+```
+
+---
+
 ## Why
 
 A stuck `pyenv` shim pegged a CPU core at 99% for ~44 hours and silently drained the laptop battery overnight. Separately, an overnight Bluetooth/network "dark wake" loop kept the machine from sleeping. The fixes existed — a launchd plist here, a shell one-liner there, a sleep hook somewhere else — but they were scattered and fragile. This repo consolidates them into one git-versioned, idempotent, inspectable place driven by a single config file and a `pm` CLI.
