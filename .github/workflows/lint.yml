@@ -1,0 +1,16 @@
+name: lint
+on:
+  push:
+  pull_request:
+jobs:
+  zsh-syntax:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: zsh -n all scripts
+        run: |
+          set -e
+          for f in bin/pm install.sh config.sh libexec/*; do
+            echo "checking $f"
+            zsh -n "$f"
+          done

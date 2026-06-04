@@ -1,0 +1,240 @@
+#!/bin/zsh
+emulate -L zsh
+set -u
+# pm — power-toolkit control surface. One config (../config.sh) drives everything.
+
+PT_ROOT=${0:A:h:h}
+source "$PT_ROOT/config.sh"
+zmodload zsh/datetime 2>/dev/null
+mkdir -p "$PT_VAR" "$PT_LOG"
+
+# Resolve the real user even when invoked via sudo, so launchd domain + HOME stay correct.
+if (( EUID == 0 )) && [[ -n "${SUDO_USER:-}" ]]; then
+  HOME=$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+  TARGET_UID=${SUDO_UID:-0}
+else
+  TARGET_UID=$(id -u)
+fi
+AGENTS_DIR="$HOME/Library/LaunchAgents"
+GUI="gui/$TARGET_UID"
+BLUEUTIL=$(command -v blueutil || true)
+SLEEPWATCHER=$(command -v sleepwatcher || true)
+
+c_green(){ print -P "%F{green}$1%f"; }
+c_red(){   print -P "%F{red}$1%f"; }
+c_dim(){   print -P "%F{8}$1%f"; }
+bar(){ print -- "────────────────────────────────────────────"; }
+
+# ---------- launchd plist generation (paths resolved at write time → portable) ----------
+gen_plist() {   # $1=label  $2=interval(0=KeepAlive)  $3..=ProgramArguments
+  local label=$1 interval=$2; shift 2
+  local out="$AGENTS_DIR/$label.plist" args=""
+  for a in "$@"; do args+="    <string>$a</string>\n"; done
+  {
+    print -- '<?xml version="1.0" encoding="UTF-8"?>'
+    print -- '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    print -- '<plist version="1.0"><dict>'
+    print -- "  <key>Label</key><string>$label</string>"
+    print -- "  <key>ProgramArguments</key><array>"
+    printf "$args"
+    print -- "  </array>"
+    if (( interval > 0 )); then
+      print -- "  <key>StartInterval</key><integer>$interval</integer>"
+      print -- "  <key>ProcessType</key><string>Background</string>"
+    else
+      print -- "  <key>KeepAlive</key><true/>"
+    fi
+    print -- "  <key>RunAtLoad</key><true/>"
+    print -- "  <key>StandardOutPath</key><string>$PT_LOG/$label.out.log</string>"
+    print -- "  <key>StandardErrorPath</key><string>$PT_LOG/$label.err.log</string>"
+    print -- '</dict></plist>'
+  } > "$out"
+  print -- "$out"
+}
+
+reload_agent() {   # $1=label  $2=plistpath  (retry around launchd's async bootout)
+  launchctl bootout "$GUI/$1" 2>/dev/null
+  local i
+  for i in 1 2 3 4 5; do
+    launchctl bootstrap "$GUI" "$2" 2>/dev/null && return 0
+    launchctl bootout "$GUI/$1" 2>/dev/null
+  done
+  return 1
+}
+
+cmd_apply() {
+  print -- "Applying mode '$PT_MODE' from $PT_ROOT/config.sh"; bar
+
+  # 1) pmset desired state (needs root)
+  local sudo="" need=()
+  if (( EUID == 0 )); then sudo=""
+  elif [[ -t 0 ]] && command -v sudo >/dev/null; then sudo="sudo"
+  elif sudo -n true 2>/dev/null; then sudo="sudo -n"
+  else sudo="SKIP"; fi
+
+  for entry in "${PMSET_DESIRED[@]}"; do
+    local prof=${entry%% *} rest=${entry#* }
+    local setting=${rest%% *} val=${rest##* }
+    local cur=$(pmset -g custom 2>/dev/null | awk -v p="$prof" -v s="$setting" '
+      /^Battery Power/{c="b"} /^AC Power/{c="c"} $1==s && (c==p||p=="a"){print $2; exit}')
+    if [[ "$cur" == "$val" ]]; then
+      c_dim "  pmset -$prof $setting = $val (already)"
+    elif [[ "$sudo" == "SKIP" ]]; then
+      need+=("sudo pmset -$prof $setting $val")
+    else
+      ${=sudo} pmset -$prof $setting $val 2>/dev/null \
+        && c_green "  pmset -$prof $setting $cur → $val" \
+        || need+=("sudo pmset -$prof $setting $val")
+    fi
+  done
+  if (( ${#need} )); then
+    print; c_red "  pmset changes need your password — run:"
+    for n in "${need[@]}"; do print -- "    $n"; done
+    print -- "  (or: sudo pm apply)"
+  fi
+
+  # 2) launchd agents (no sudo)
+  print; bar
+  local p
+  p=$(gen_plist "$WATCHDOG_LABEL" "$WATCHDOG_INTERVAL_SEC" "$PT_ROOT/libexec/cpu-watchdog.sh")
+  reload_agent "$WATCHDOG_LABEL" "$p"; c_green "  agent  $WATCHDOG_LABEL (every ${WATCHDOG_INTERVAL_SEC}s)"
+  p=$(gen_plist "$SAVER_LABEL" "$SAVER_INTERVAL_SEC" "$PT_ROOT/libexec/power-saver.sh" "tick")
+  reload_agent "$SAVER_LABEL" "$p"; c_green "  agent  $SAVER_LABEL (every ${SAVER_INTERVAL_SEC}s)"
+
+  if [[ -n "$SLEEPWATCHER" ]]; then
+    p=$(gen_plist "$SLEEPWATCHER_LABEL" 0 "$SLEEPWATCHER" "-s" "$PT_ROOT/libexec/on-sleep" "-w" "$PT_ROOT/libexec/on-wake")
+    reload_agent "$SLEEPWATCHER_LABEL" "$p"; c_green "  agent  $SLEEPWATCHER_LABEL (instant sleep/wake hooks)"
+  else
+    c_red "  sleepwatcher missing → BT re-enables at next saver tick, not instantly. brew install sleepwatcher"
+  fi
+  [[ -z "$BLUEUTIL" ]] && c_red "  blueutil missing → Bluetooth saver is a no-op. brew install blueutil"
+  print; c_green "apply complete."
+}
+
+cmd_install() {
+  chmod +x "$PT_ROOT"/bin/pm "$PT_ROOT"/libexec/*(.) 2>/dev/null
+  # deps
+  for t in blueutil sleepwatcher; do
+    command -v $t >/dev/null || print -- "  note: '$t' not installed — run: brew install $t"
+  done
+  # symlink onto PATH
+  mkdir -p "$HOME/bin"; ln -sf "$PT_ROOT/bin/pm" "$HOME/bin/pm"
+  c_green "  linked $HOME/bin/pm"
+  # migrate the old standalone watchdog, if present
+  if [[ -f "$HOME/bin/cpu-watchdog.sh" ]]; then
+    launchctl bootout "$GUI/$WATCHDOG_LABEL" 2>/dev/null
+    rm -f "$HOME/bin/cpu-watchdog.sh"
+    c_dim "  migrated old standalone watchdog"
+  fi
+  cmd_apply
+  print; print -- "Add ~/bin to PATH if needed, then: pm status"
+}
+
+cmd_uninstall() {
+  for l in "$WATCHDOG_LABEL" "$SAVER_LABEL" "$SLEEPWATCHER_LABEL"; do
+    launchctl bootout "$GUI/$l" 2>/dev/null
+    rm -f "$AGENTS_DIR/$l.plist"
+    c_dim "  removed $l"
+  done
+  [[ -n "$BLUEUTIL" ]] && { blueutil -p 1 2>/dev/null; rm -f "$PT_VAR/bt-dropped" "$PT_VAR/bt-closed-since"; }
+  rm -f "$HOME/bin/pm"
+  c_green "uninstalled agents + hooks. Bluetooth re-enabled."
+  print -- "pmset knobs left as-is. To revert: sudo pmset -b tcpkeepalive 1; sudo pmset -b powernap 1"
+}
+
+agent_state() { launchctl print "$GUI/$1" >/dev/null 2>&1 && c_green "loaded" || c_red "NOT loaded"; }
+
+unexpected_runaway() {   # prints + returns 0 if a NON-allowlisted process is pegged right now
+  local pid cpu comm a skip
+  while read -r pid cpu comm; do
+    (( cpu >= CPU_THRESHOLD )) || continue
+    skip=0
+    for a in ${=ALERT_ALLOWLIST} WindowServer; do [[ "$comm" == *$a* ]] && skip=1; done
+    (( skip )) && continue
+    print -- "$comm ($pid) ${cpu}%"; return 0
+  done < <(ps -arcwwwxo pid=,%cpu=,comm=)
+  return 1
+}
+
+cmd_status() {
+  local watts=$(ioreg -rn AppleSmartBattery 2>/dev/null | awk -F'= ' '
+    /"InstantAmperage"/{a=$2} /"Voltage"/{v=$2} END{ if(a>9e18)a=a-18446744073709551616; printf "%.1f", (-a/1000)*(v/1000) }')
+  local pct=$(pmset -g batt | grep -oE '[0-9]+%' | head -1)
+  local src=$(pmset -g batt | grep -q "AC Power" && print "AC" || print "Battery")
+  local lid=$(ioreg -r -k AppleClamshellState 2>/dev/null | grep -q '"AppleClamshellState" = Yes' && print "closed" || print "open")
+  local bt="?" btp=""
+  [[ -n "$BLUEUTIL" ]] && btp=$(blueutil -p 2>/dev/null)
+  [[ "$btp" == 1 ]] && bt=on; [[ "$btp" == 0 ]] && bt=off
+
+  bar; print -- "  power-toolkit  ·  mode: $PT_MODE"; bar
+  print -- "  Power     $src   ${pct}   ~${watts} W   lid:$lid   bt:$bt"
+  print; print -- "  Agents"
+  print -n  "    watchdog       "; agent_state "$WATCHDOG_LABEL"
+  print -n  "    power-saver    "; agent_state "$SAVER_LABEL"
+  print -n  "    sleepwatcher   "; [[ -n "$SLEEPWATCHER" ]] && agent_state "$SLEEPWATCHER_LABEL" || c_red "not installed"
+  print; print -- "  pmset (desired → actual)"
+  for entry in "${PMSET_DESIRED[@]}"; do
+    local prof=${entry%% *} rest=${entry#* }
+    local s=${rest%% *} v=${rest##* }
+    local cur=$(pmset -g custom 2>/dev/null | awk -v p="$prof" -v s="$s" '
+      /^Battery Power/{c="b"} /^AC Power/{c="c"} $1==s && (c==p||p=="a"){print $2; exit}')
+    [[ "$cur" == "$v" ]] && c_green "    -$prof $s = $v" || c_red "    -$prof $s want $v, have ${cur:-?}  (run: pm apply)"
+  done
+  print; print -- "  Top CPU"
+  ps -arcwwwxo pid=,%cpu=,comm= | head -3 | sed 's/^/    /'
+  print; print -- "  Recent watchdog alerts"
+  if [[ -s "$PT_LOG/watchdog.log" ]]; then tail -3 "$PT_LOG/watchdog.log" | sed 's/^/    /'; else c_dim "    (none)"; fi
+  bar
+}
+
+cmd_doctor() {
+  local ok=0 warn=0
+  chk(){ if eval "$2"; then c_green "  ✓ $1"; ((ok++)); else c_red "  ✗ $1 — $3"; ((warn++)); fi }
+  bar; print -- "  pm doctor"; bar
+  chk "blueutil installed"        '[[ -n "$BLUEUTIL" ]]'        "brew install blueutil"
+  chk "sleepwatcher installed"    '[[ -n "$SLEEPWATCHER" ]]'    "brew install sleepwatcher"
+  chk "watchdog agent loaded"     'launchctl print "$GUI/$WATCHDOG_LABEL" >/dev/null 2>&1' "pm apply"
+  chk "saver agent loaded"        'launchctl print "$GUI/$SAVER_LABEL" >/dev/null 2>&1'    "pm apply"
+  chk "sleep/wake hooks loaded"   'launchctl print "$GUI/$SLEEPWATCHER_LABEL" >/dev/null 2>&1' "pm apply"
+  chk "clamshell state readable"  'ioreg -r -k AppleClamshellState 2>/dev/null | grep -q AppleClamshellState' "macOS API changed?"
+  [[ -n "$BLUEUTIL" ]] && chk "Bluetooth controllable" 'blueutil -p >/dev/null 2>&1' "grant Bluetooth: System Settings > Privacy & Security > Bluetooth"
+  local hot=$(unexpected_runaway)
+  [[ -n "$hot" ]] && c_dim "  · note: $hot is hot this instant (only alerts if sustained ~${SUSTAIN_MIN}m)"
+  bar; print -- "  $ok ok, $warn need attention"
+}
+
+cmd_mode() {
+  local m=${1:-}
+  case "$m" in
+    balanced|aggressive|conservative) print -- "$m" > "$PT_VAR/mode"; c_green "mode → $m"; exec "$0" apply ;;
+    "") print -- "current mode: $PT_MODE   (balanced|aggressive|conservative)" ;;
+    *) c_red "unknown mode '$m' (balanced|aggressive|conservative)"; return 1 ;;
+  esac
+}
+
+cmd_logs() {
+  case "${1:-all}" in
+    watchdog) tail -n 30 -f "$PT_LOG/watchdog.log" ;;
+    saver)    tail -n 30 -f "$PT_LOG/saver.log" ;;
+    *)        print -- "== watchdog =="; tail -n 15 "$PT_LOG/watchdog.log" 2>/dev/null
+              print -- "== saver =="; tail -n 15 "$PT_LOG/saver.log" 2>/dev/null ;;
+  esac
+}
+
+case "${1:-status}" in
+  status)    cmd_status ;;
+  apply)     cmd_apply ;;
+  install)   cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  doctor)    cmd_doctor ;;
+  mode)      shift; cmd_mode "$@" ;;
+  logs)      shift; cmd_logs "$@" ;;
+  *) print -- "pm — power-toolkit
+  pm status            dashboard (default)
+  pm apply             reconcile pmset + reload agents from config.sh
+  pm install           first-time setup (deps, symlink, apply)
+  pm uninstall         remove agents/hooks, re-enable Bluetooth
+  pm doctor            health check
+  pm mode [name]       balanced | aggressive | conservative
+  pm logs [watchdog|saver]" ;;
+esac
