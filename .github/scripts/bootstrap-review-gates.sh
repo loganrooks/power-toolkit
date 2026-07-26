@@ -4,11 +4,11 @@
 #   .github/scripts/bootstrap-review-gates.sh                    # this repo
 #   .github/scripts/bootstrap-review-gates.sh owner/other-repo   # somewhere else
 #   CHECKS='build,test' .github/scripts/bootstrap-review-gates.sh owner/other-repo
-#   MERGE_TARGETS='feat/my-stack-base' .github/scripts/bootstrap-review-gates.sh owner/repo
 #
-# MERGE_TARGETS names extra branches to protect as PR bases — the base of an open stacked PR.
-# It is per-invocation, never baked into the shipped JSON, because a branch name from this
-# repository is meaningless in someone else's and would leave their real stack bases open.
+# The ruleset protects the DEFAULT BRANCH ONLY, and there is deliberately no knob to extend it
+# to a stacked PR's base. Review events do not fire for PRs based on anything but the default
+# branch, so the gate cannot keep such a status current — protecting one would create a
+# required check that silently passes, which is worse than no check at all.
 #
 # Installs, in the target repo:
 #   1. .github/workflows/review-gate.yml  — reply+react enforcement, pushed to the DEFAULT
@@ -61,35 +61,34 @@ if [[ -n "$EXISTING_SHA" && "$REMOTE_B64" == "$LOCAL_B64" ]]; then
 elif put_file "$DEFAULT_BRANCH" "$MSG"; then
   echo "    workflow: written to $DEFAULT_BRANCH"
 else
-  # Deliberately UNPREFIXED. The ruleset shipped in the previous version globbed
-  # refs/heads/{feat,fix,chore,docs}/** with no bypass actors, so a `chore/`-prefixed fallback
-  # branch is rejected by the very installations this fallback exists to upgrade — the same
-  # wall as the direct write, one level down. Any new prefix here must be checked against the
-  # OLD ruleset's globs, not the current one.
-  BR=review-gate-bootstrap
   HEAD_SHA=$(gh api "repos/$TARGET/git/ref/heads/$DEFAULT_BRANCH" --jq .object.sha)
 
-  # The branch survives a squash- or rebase-merge unless someone deletes it, and after such a
-  # merge its tip is NOT an ancestor of the default branch. Swallowing the create failure would
-  # then commit the next upgrade on that stale tip, replaying the previous change or producing
-  # an add/add conflict in this very file. Repoint it — unless a bootstrap PR is already open
-  # against it, in which case force-updating would rewrite something under review.
-  if gh api "repos/$TARGET/git/ref/heads/$BR" >/dev/null 2>&1; then
-    if [[ -z "$(gh pr list --repo "$TARGET" --head "$BR" --state open --json number --jq '.[0].number // empty')" ]]; then
-      gh api -X PATCH "repos/$TARGET/git/refs/heads/$BR" -F force=true -f "sha=$HEAD_SHA" >/dev/null
-      echo "    reset stale $BR onto $DEFAULT_BRANCH"
-    else
-      echo "    reusing $BR — a bootstrap PR is already open against it"
-    fi
-  else
-    gh api -X POST "repos/$TARGET/git/refs" -f "ref=refs/heads/$BR" -f "sha=$HEAD_SHA" >/dev/null
-  fi
+  # Branch name is UNPREFIXED and keyed to the default-branch tip. Both parts are deliberate:
+  #   - unprefixed, because the ruleset shipped by the PREVIOUS version globbed
+  #     refs/heads/{feat,fix,chore,docs}/** with no bypass actors, so a prefixed fallback branch
+  #     hits the same wall as the direct write on exactly the installations being upgraded. Any
+  #     new prefix must be checked against the OLD ruleset's globs, not the current one.
+  #   - keyed to $HEAD_SHA, so the ref is unique per default-branch state and is therefore
+  #     always OURS. A fixed name has to be force-reset when it survives a squash-merge, and
+  #     resetting means guessing whether an existing branch of that name belongs to us — on a
+  #     repo we do not own, a wrong guess discards someone's commits. Not worth the cleverness.
+  BR="review-gate-bootstrap-${HEAD_SHA:0:7}"
+  gh api -X POST "repos/$TARGET/git/refs" -f "ref=refs/heads/$BR" -f "sha=$HEAD_SHA" >/dev/null 2>&1 || true
 
   EXISTING_SHA=$(gh api "repos/$TARGET/contents/$REMOTE_PATH?ref=$BR" --jq .sha 2>/dev/null || true)
   put_file "$BR" "$MSG" || { echo "    workflow: FAILED on both $DEFAULT_BRANCH and $BR" >&2; exit 1; }
+
+  # A `gh pr create` failure that is NOT "already exists" — no PR-create permission, say —
+  # would otherwise fall through to an empty `gh pr list` result, and the script would report a
+  # successful bootstrap while the workflow sat stranded on a branch. Require a real URL.
   PR_URL=$(gh pr create --repo "$TARGET" --base "$DEFAULT_BRANCH" --head "$BR" --title "$MSG" \
              --body 'Automated `review-gate` bootstrap. The default branch is protected by the gate ruleset, so this could not be committed directly.' 2>/dev/null \
-           || gh pr list --repo "$TARGET" --head "$BR" --state open --json url --jq '.[0].url')
+           || gh pr list --repo "$TARGET" --head "$BR" --state open --json url --jq '.[0].url // empty')
+  if [[ ! "$PR_URL" =~ ^https?:// ]]; then
+    echo "    workflow: committed to $BR but NO PULL REQUEST could be opened." >&2
+    echo "              The workflow is not live. Open a PR from $BR into $DEFAULT_BRANCH by hand." >&2
+    exit 1
+  fi
   WORKFLOW_PENDING=1
   echo "    workflow: $DEFAULT_BRANCH is protected -> opened $PR_URL"
 fi
@@ -110,7 +109,7 @@ fi
 # both POST and PUT — so documentation cannot ride along in the payload. JSON has no comment
 # syntax and the explanation genuinely belongs next to the field it explains, so `_`-prefixed
 # keys are stripped recursively here instead of being banned from the file.
-PAYLOAD=$(CHECKS="${CHECKS:-}" MERGE_TARGETS="${MERGE_TARGETS:-}" python3 -c '
+PAYLOAD=$(CHECKS="${CHECKS:-}" python3 -c '
 import json, os, sys
 def strip(o):
     if isinstance(o, dict):  return {k: strip(v) for k, v in o.items() if not k.startswith("_")}
@@ -125,15 +124,6 @@ if want:
     for rule in p["rules"]:
         if rule["type"] == "required_status_checks":
             rule["parameters"]["required_status_checks"] = [{"context": c} for c in want]
-
-# Stacked-PR bases are per-repository, so they are supplied per invocation and never baked
-# into the shipped JSON. Bare names are accepted and normalised.
-extra = [t.strip() for t in os.environ.get("MERGE_TARGETS", "").split(",") if t.strip()]
-inc = p["conditions"]["ref_name"]["include"]
-for t in extra:
-    ref = t if t.startswith(("refs/", "~")) else "refs/heads/" + t
-    if ref not in inc:
-        inc.append(ref)
 
 json.dump(p, sys.stdout)
 ' < "$RULESET")
