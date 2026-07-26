@@ -8,11 +8,24 @@ name: review-gate
 # which is what the ruleset requires. The workflow job itself always exits 0 on a clean
 # evaluation so there is exactly ONE red thing to look at when the gate is unmet.
 #
-# Trigger choice is load-bearing: `pull_request_target`, `pull_request_review`,
-# `pull_request_review_comment` and `issue_comment` ALL resolve the workflow file from the
-# DEFAULT branch. That is why this gate works on stacked PRs whose base branch predates it,
-# and why plain `pull_request` is deliberately not used. Nothing from the head branch is
-# ever checked out or executed here — this job reads PR metadata and writes a status.
+# TRIGGER SEMANTICS — measured on this repo 2026-07-26, not assumed:
+#   `pull_request_review` and `pull_request_review_comment` fire ONLY when the pull request's
+#   base branch is the repository's DEFAULT branch. On PR #2 (base `feat/mem-watchdog-m0-observe`)
+#   a Codex review and two human replies produced no run at all; the identical event types on
+#   PR #1 (base `main`) fired immediately. Isolated by changing only the base branch.
+#
+#   That is why `schedule` below is load-bearing rather than belt-and-braces. Without it a
+#   STACKED pull request keeps whatever status it was given at open time — which is `success`,
+#   vacuously, because no reviewer had commented yet — and a stale-green REQUIRED check means
+#   the PR is mergeable with unanswered findings. The gate would fail OPEN, the one direction
+#   a gate must never fail.
+#
+#   All triggers here resolve the workflow file from the DEFAULT branch, so the gate also
+#   covers PRs whose base branch predates it. Plain `pull_request` would resolve from the head
+#   branch and silently not run at all.
+#
+# Nothing from the head branch is ever checked out or executed: this job reads PR metadata
+# and writes a commit status.
 
 on:
   pull_request_target:
@@ -23,11 +36,16 @@ on:
     types: [created, edited, deleted]
   issue_comment:
     types: [created, edited, deleted]
+  schedule:
+    # Bounds staleness for stacked PRs at ~10 min. GitHub disables scheduled workflows after
+    # 60 days without repository activity; if that happens the gate stops re-evaluating
+    # stacked PRs and they hold their last verdict.
+    - cron: '*/10 * * * *'
   workflow_dispatch:
     inputs:
       pr:
-        description: PR number to re-evaluate
-        required: true
+        description: PR number to re-evaluate (blank = every open PR)
+        required: false
 
 permissions:
   contents: read
@@ -35,8 +53,8 @@ permissions:
   statuses: write
 
 concurrency:
-  group: review-gate-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
-  cancel-in-progress: true
+  group: review-gate-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr || 'sweep' }}
+  cancel-in-progress: false
 
 jobs:
   gate:
@@ -56,7 +74,6 @@ jobs:
 
           repo = os.environ["REPO"]
           owner, name = repo.split("/")
-          pr = int(os.environ["PR"])
           run_url = os.environ["RUN_URL"]
 
           QUERY = """
@@ -91,17 +108,12 @@ jobs:
           }
           """
 
-          proc = subprocess.run(
-              ["gh", "api", "graphql", "-f", "query=" + QUERY,
-               "-f", "owner=" + owner, "-f", "name=" + name, "-F", "num=%d" % pr],
-              capture_output=True, text=True)
-          if proc.returncode != 0:
-              sys.stderr.write(proc.stderr)
-              sys.exit("review-gate: GraphQL query failed; refusing to publish a verdict")
-
-          data = json.loads(proc.stdout)["data"]["repository"]["pullRequest"]
-          sha = data["headRefOid"]
-          pr_author = (data["author"] or {}).get("login")
+          def gh(args):
+              proc = subprocess.run(["gh"] + args, capture_output=True, text=True)
+              if proc.returncode != 0:
+                  sys.stderr.write(proc.stderr)
+                  return None
+              return proc.stdout
 
           def reactions(node):
               return sum(g["reactors"]["totalCount"] for g in (node.get("reactionGroups") or []))
@@ -109,75 +121,106 @@ jobs:
           def login(node):
               return ((node or {}).get("author") or {}).get("login")
 
-          unmet = []
+          def evaluate(pr):
+              out = gh(["api", "graphql", "-f", "query=" + QUERY,
+                        "-f", "owner=" + owner, "-f", "name=" + name, "-F", "num=%d" % pr])
+              if out is None:
+                  sys.stderr.write("review-gate: GraphQL failed for PR %d; no verdict published\n" % pr)
+                  return None
 
-          # Truncation guard: an unseen thread must never read as a satisfied one.
-          for field in ("reviewThreads", "reviews", "comments"):
-              if data[field]["pageInfo"]["hasNextPage"]:
-                  unmet.append(
-                      "%s exceeds the 100-item query window — the gate cannot see everything on "
-                      "this PR. Split it, or paginate this workflow." % field)
+              data = json.loads(out)["data"]["repository"]["pullRequest"]
+              sha = data["headRefOid"]
+              pr_author = (data["author"] or {}).get("login")
+              unmet = []
 
-          # 1. Inline review threads: reply + reaction + resolution.
-          for thread in data["reviewThreads"]["nodes"]:
-              comments = thread["comments"]["nodes"]
-              if not comments:
-                  continue
-              head = comments[0]
-              reviewer = login(head)
-              if reviewer is None or reviewer == pr_author:
-                  continue
-              where = "%s:%s" % (head.get("path") or "?", head.get("line") or "?")
-              tag = "thread %s by @%s" % (where, reviewer)
-              if not any(login(c) == pr_author for c in comments[1:]):
-                  unmet.append("%s — no reply from @%s: %s" % (tag, pr_author, head["url"]))
-              if reactions(head) == 0:
-                  unmet.append("%s — no reaction on the finding: %s" % (tag, head["url"]))
-              if not thread["isResolved"]:
-                  unmet.append("%s — unresolved: %s" % (tag, head["url"]))
+              # Truncation guard: an unseen thread must never read as a satisfied one.
+              for field in ("reviewThreads", "reviews", "comments"):
+                  if data[field]["pageInfo"]["hasNextPage"]:
+                      unmet.append(
+                          "%s exceeds the 100-item query window — the gate cannot see everything "
+                          "on this PR. Split it, or paginate this workflow." % field)
 
-          # 2. Review summaries with a body (Codex/CR post their overview here).
-          for review in data["reviews"]["nodes"]:
-              reviewer = login(review)
-              if reviewer is None or reviewer == pr_author:
-                  continue
-              if review["state"] == "PENDING" or not (review["body"] or "").strip():
-                  continue
-              if reactions(review) == 0:
-                  unmet.append("review summary by @%s — no reaction: %s" % (reviewer, review["url"]))
+              # 1. Inline review threads: reply + reaction + resolution.
+              for thread in data["reviewThreads"]["nodes"]:
+                  comments = thread["comments"]["nodes"]
+                  if not comments:
+                      continue
+                  head = comments[0]
+                  reviewer = login(head)
+                  if reviewer is None or reviewer == pr_author:
+                      continue
+                  where = "%s:%s" % (head.get("path") or "?", head.get("line") or "?")
+                  tag = "thread %s by @%s" % (where, reviewer)
+                  if not any(login(c) == pr_author for c in comments[1:]):
+                      unmet.append("%s — no reply from @%s: %s" % (tag, pr_author, head["url"]))
+                  if reactions(head) == 0:
+                      unmet.append("%s — no reaction on the finding: %s" % (tag, head["url"]))
+                  if not thread["isResolved"]:
+                      unmet.append("%s — unresolved: %s" % (tag, head["url"]))
 
-          # 3. Top-level PR comments from anyone other than the author.
-          for comment in data["comments"]["nodes"]:
-              reviewer = login(comment)
-              if reviewer is None or reviewer == pr_author:
-                  continue
-              if reactions(comment) == 0:
-                  unmet.append("comment by @%s — no reaction: %s" % (reviewer, comment["url"]))
+              # 2. Review summaries with a body (Codex/CR post their overview here).
+              for review in data["reviews"]["nodes"]:
+                  reviewer = login(review)
+                  if reviewer is None or reviewer == pr_author:
+                      continue
+                  if review["state"] == "PENDING" or not (review["body"] or "").strip():
+                      continue
+                  if reactions(review) == 0:
+                      unmet.append("review summary by @%s — no reaction: %s" % (reviewer, review["url"]))
 
-          state = "failure" if unmet else "success"
-          if unmet:
-              description = "%d reviewer thread(s) not replied to / reacted to / resolved" % len(unmet)
+              # 3. Top-level PR comments from anyone other than the author.
+              for comment in data["comments"]["nodes"]:
+                  reviewer = login(comment)
+                  if reviewer is None or reviewer == pr_author:
+                      continue
+                  if reactions(comment) == 0:
+                      unmet.append("comment by @%s — no reaction: %s" % (reviewer, comment["url"]))
+
+              state = "failure" if unmet else "success"
+              description = ("%d reviewer thread(s) not replied to / reacted to / resolved" % len(unmet)
+                             if unmet else
+                             "every reviewer thread replied to, reacted to, and resolved")
+
+              gh(["api", "repos/%s/statuses/%s" % (repo, sha),
+                  "-f", "state=" + state,
+                  "-f", "context=review-gate",
+                  "-f", "description=" + description[:139],
+                  "-f", "target_url=" + run_url])
+
+              return (pr, sha, state, unmet)
+
+          raw = (os.environ.get("PR") or "").strip()
+          if raw:
+              targets = [int(raw)]
           else:
-              description = "every reviewer thread replied to, reacted to, and resolved"
+              listing = gh(["api", "repos/%s/pulls?state=open&per_page=100" % repo,
+                            "--jq", "[.[].number]"])
+              if listing is None:
+                  sys.exit("review-gate: could not list open PRs")
+              targets = json.loads(listing)
 
-          summary = ["# review-gate — `%s`" % state, "", "PR #%d @ `%s`" % (pr, sha[:7]), ""]
-          if unmet:
-              summary.append("Unmet obligations:")
-              summary.append("")
-              summary.extend("- %s" % u for u in unmet)
-              summary += ["", "A verdict block belongs on every reply — see `docs/review-gates.md`."]
-          else:
-              summary.append("No outstanding reviewer obligations.")
+          results = [r for r in (evaluate(p) for p in targets) if r is not None]
+
+          lines = ["# review-gate", ""]
+          for pr, sha, state, unmet in results:
+              lines.append("## PR #%d @ `%s` — **%s**" % (pr, sha[:7], state))
+              lines.append("")
+              if unmet:
+                  lines.extend("- %s" % u for u in unmet)
+                  lines.append("")
+                  lines.append("A verdict block belongs on every reply — see `docs/review-gates.md`.")
+              else:
+                  lines.append("No outstanding reviewer obligations.")
+              lines.append("")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
-              fh.write("\n".join(summary) + "\n")
+              fh.write("\n".join(lines) + "\n")
 
-          subprocess.run(
-              ["gh", "api", "repos/%s/statuses/%s" % (repo, sha),
-               "-f", "state=" + state,
-               "-f", "context=review-gate",
-               "-f", "description=" + description[:139],
-               "-f", "target_url=" + run_url],
-              check=True)
+          for pr, _, state, unmet in results:
+              print("review-gate: PR #%d %s (%d unmet)" % (pr, state, len(unmet)))
 
-          print("review-gate: %s (%d unmet)" % (state, len(unmet)))
+          # A PR we could not evaluate has NO fresh status, so it silently keeps its previous
+          # one. Fail the run loudly rather than let a sweep report success over a gap.
+          if len(results) != len(targets):
+              sys.exit("review-gate: %d of %d PR evaluations failed; their statuses are STALE"
+                       % (len(targets) - len(results), len(targets)))
           PY

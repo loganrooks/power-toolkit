@@ -4,12 +4,10 @@
   "enforcement": "active",
   "conditions": {
     "ref_name": {
+      "_comment": "MERGE TARGETS ONLY — list branches you merge INTO, never a glob over branches you work ON. These rules gate PUSHES to any matching ref, so `refs/heads/feat/**` makes every feature branch reject your own commits with GH013 until they go through their own PR. GitHub rulesets cannot express 'gate this ref when it is a PR base but allow pushes when it is a PR head', so a stacked PR's base has to be listed by hand for as long as the stack is open, and removed after.",
       "include": [
         "~DEFAULT_BRANCH",
-        "refs/heads/feat/**",
-        "refs/heads/fix/**",
-        "refs/heads/chore/**",
-        "refs/heads/docs/**"
+        "refs/heads/feat/mem-watchdog-m0-observe"
       ],
       "exclude": []
     }
