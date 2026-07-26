@@ -267,17 +267,29 @@ jobs:
                   sys.exit("review-gate: could not list open PRs")
               rows = [ln.split() for ln in listing.splitlines() if ln.strip()]
 
-              # Stacked PRs first. Their review events never fire (see TRIGGER SEMANTICS above),
-              # so this sweep is their ONLY source of a fresh verdict; a PR based on the default
-              # branch that loses its slot still has event coverage.
-              rows.sort(key=lambda r: r[1] == default_branch)
-              targets = [int(r[0]) for r in rows]
+              # ONLY stacked PRs — those whose base is not the default branch.
+              #
+              # This is a scope REDUCTION made after three review rounds kept producing budget
+              # and race findings against a sweep over all open PRs. The requirement was always
+              # narrow: a PR based on the default branch already gets a fresh verdict from
+              # pull_request_review / _review_comment / issue_comment, and only stacked PRs get
+              # nothing (see TRIGGER SEMANTICS). Polling everything to serve that was roughly
+              # fifty times the necessary traffic, and every attempt to make it fit the rate
+              # limits — dedupe, then a cap, then a freshness re-read — either added calls or
+              # merely moved the ceiling. Sweeping the population that actually needs it makes
+              # the budget question almost vacuous instead of almost breached.
+              #
+              # Residual, stated rather than closed: if an event-triggered run FAILS for a
+              # default-branch PR, its status stays stale and no sweep will correct it. That
+              # failure is loud — a red run in the Actions tab — so it satisfies the invariant
+              # above, but it is a real gap and not an engineered-away one.
+              targets = [int(n) for n, base in rows if base != default_branch]
 
-              # GITHUB_TOKEN allows ~1000 GraphQL points per repo per hour and this sweep runs 6
-              # times an hour, so past ~150 open PRs the tail would start hitting rate limits and
-              # silently retain stale statuses. Truncate deliberately and LOUDLY instead: no
-              # silent caps, because a cap nobody reports reads as full coverage.
-              BUDGET = 150
+              # Two REST calls per PR per sweep (publish()'s status read, and the race guard's
+              # pulls/{n}) x 6 sweeps/hour against GITHUB_TOKEN's 1000 REST requests/hour/repo
+              # gives a ceiling of 83 PRs. REST is the binding limit here, not GraphQL points.
+              # Truncate deliberately and LOUDLY: a cap nobody reports reads as full coverage.
+              BUDGET = 80
               if len(targets) > BUDGET:
                   skipped = targets[BUDGET:]
                   targets = targets[:BUDGET]

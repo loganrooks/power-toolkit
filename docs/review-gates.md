@@ -109,9 +109,20 @@ and defers only when the PR can be **positively** shown to have moved. Every amb
 parse failure, missing value, format surprise — falls through to publishing, because
 abstaining leaves a stale status and stale means green. The safe default is to write.
 
-The budget fix orders stacked PRs first, since they have no event coverage at all, caps the
-sweep at 150, and then **exits non-zero naming every PR it skipped**. A cap nobody reports
-reads as full coverage.
+The budget fix is a **scope reduction**, arrived at after three review rounds kept producing
+budget and race findings against a sweep over all open PRs. The sweep now evaluates *only*
+PRs whose base is not the default branch — the population that gets no review events at all.
+Everything else already has event coverage, so polling it was roughly fifty times the
+necessary traffic, and each attempt to make that fit the rate limits (dedupe, then a cap, then
+a freshness re-read) either added calls or moved the ceiling.
+
+The binding limit is REST, not GraphQL: two REST calls per PR per sweep × 6 sweeps/hour
+against 1000 requests/hour/repo gives a ceiling of 83, so the cap is 80 and the run **exits
+non-zero naming every PR it skipped**. A cap nobody reports reads as full coverage.
+
+**Residual, not closed:** if an event-triggered run *fails* for a default-branch PR, its
+status stays stale and no sweep corrects it. That failure is loud — a red run in the Actions
+tab — so it satisfies the invariant, but it is a real gap rather than an engineered-away one.
 
 **Residual risk, not closed:** if the statuses API itself is unavailable, a green SHA cannot be
 turned red at all. The run fails visibly and the next sweep retries, so exposure is bounded by

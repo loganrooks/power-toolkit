@@ -68,7 +68,23 @@ else
   # OLD ruleset's globs, not the current one.
   BR=review-gate-bootstrap
   HEAD_SHA=$(gh api "repos/$TARGET/git/ref/heads/$DEFAULT_BRANCH" --jq .object.sha)
-  gh api -X POST "repos/$TARGET/git/refs" -f "ref=refs/heads/$BR" -f "sha=$HEAD_SHA" >/dev/null 2>&1 || true
+
+  # The branch survives a squash- or rebase-merge unless someone deletes it, and after such a
+  # merge its tip is NOT an ancestor of the default branch. Swallowing the create failure would
+  # then commit the next upgrade on that stale tip, replaying the previous change or producing
+  # an add/add conflict in this very file. Repoint it — unless a bootstrap PR is already open
+  # against it, in which case force-updating would rewrite something under review.
+  if gh api "repos/$TARGET/git/ref/heads/$BR" >/dev/null 2>&1; then
+    if [[ -z "$(gh pr list --repo "$TARGET" --head "$BR" --state open --json number --jq '.[0].number // empty')" ]]; then
+      gh api -X PATCH "repos/$TARGET/git/refs/heads/$BR" -F force=true -f "sha=$HEAD_SHA" >/dev/null
+      echo "    reset stale $BR onto $DEFAULT_BRANCH"
+    else
+      echo "    reusing $BR — a bootstrap PR is already open against it"
+    fi
+  else
+    gh api -X POST "repos/$TARGET/git/refs" -f "ref=refs/heads/$BR" -f "sha=$HEAD_SHA" >/dev/null
+  fi
+
   EXISTING_SHA=$(gh api "repos/$TARGET/contents/$REMOTE_PATH?ref=$BR" --jq .sha 2>/dev/null || true)
   put_file "$BR" "$MSG" || { echo "    workflow: FAILED on both $DEFAULT_BRANCH and $BR" >&2; exit 1; }
   PR_URL=$(gh pr create --repo "$TARGET" --base "$DEFAULT_BRANCH" --head "$BR" --title "$MSG" \
