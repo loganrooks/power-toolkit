@@ -10,13 +10,23 @@ mkdir -p "$PT_LOG"
 STATE="$PT_VAR/cpu-state.tsv"            # pid \t hotcount \t notedcount \t comm
 LOG="$PT_LOG/watchdog.log"
 
-SUSTAIN_CHECKS=$(( (SUSTAIN_MIN * 60 + WATCHDOG_INTERVAL_SEC - 1) / WATCHDOG_INTERVAL_SEC ))
-(( SUSTAIN_CHECKS < 1 )) && SUSTAIN_CHECKS=1
+# N observations spaced WATCHDOG_INTERVAL_SEC apart span (N-1)*interval of ELAPSED time, not
+# N*interval. Both the threshold and the reported duration were off by one interval: the
+# balanced per-process gate alerted after 2 intervals (10 min) while claiming 15, and
+# `AGG_SUSTAIN_MIN=5` in aggressive mode collapsed to a SINGLE sample claiming 5 sustained
+# minutes. Derived in ONE place so the per-process and aggregate gates cannot drift apart.
+# (Codex F1 on PR #2 — which saw only the aggregate site, since the per-process one predates
+# the diff. Fixed as a class.)
+sustain_checks() {                      # $1 = minutes -> REPLY = observations required
+  REPLY=$(( ($1 * 60 + WATCHDOG_INTERVAL_SEC - 1) / WATCHDOG_INTERVAL_SEC + 1 ))
+  (( REPLY < 2 )) && REPLY=2            # a single sample spans zero elapsed time
+}
+sustain_checks $SUSTAIN_MIN; SUSTAIN_CHECKS=$REPLY
 RENOTIFY_EVERY=$(( SUSTAIN_CHECKS * 4 ))
 
 ts() { strftime '%Y-%m-%d %H:%M:%S' $EPOCHSECONDS; }
 notify() { osascript -e "display notification \"$2\" with title \"$1\" sound name \"Submarine\"" >/dev/null 2>&1; }
-mins_for() { print -- $(( $1 * WATCHDOG_INTERVAL_SEC / 60 )); }
+mins_for() { print -- $(( ($1 - 1) * WATCHDOG_INTERVAL_SEC / 60 )); }   # elapsed, not observed count
 
 typeset -A HOT NOTED
 if [[ -f "$STATE" ]]; then
@@ -48,13 +58,23 @@ while read -r pid cpu comm; do
 
   count=$(( ${HOT[$pid]:-0} + 1 ))
   noted=${NOTED[$pid]:-0}
+
+  # A named culprit EXISTS as soon as something is sustained-hot — not merely on the ticks
+  # where a notification happens to be due. `count` accumulates across invocations via STATE,
+  # so this spans ticks. Previously this was set inside `if (( due ))`, which made the flag mean
+  # "we notified this tick"; because the two schedules interleave rather than coincide (balanced:
+  # per-process at 4, 16, 28…; aggregate at 3, 11, 19…), an ongoing incident with a named hot
+  # process kept re-emitting AGG-DISTRIBUTED and its "No single process is hot" notification.
+  # (Codex F2 on PR #2.) Alert-allowlisted daemons `continue` above and deliberately never set
+  # this: "culprit" means something we would have named, not merely something busy.
+  (( count >= SUSTAIN_CHECKS )) && AGG_PERPROC_FIRED=1
+
   due=0
   if (( count == SUSTAIN_CHECKS )); then due=1
   elif (( count > SUSTAIN_CHECKS && count - noted >= RENOTIFY_EVERY )); then due=1
   fi
 
   if (( due )); then
-    AGG_PERPROC_FIRED=1            # a named culprit exists; aggregate alert de-escalates to corroboration
     etime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
     msg="$comm (pid $pid) — ${cpu}% CPU for ~$(mins_for $count)+ min (process up $etime)"
     print -- "$(ts) ALERT  $msg" >> "$LOG"
@@ -90,8 +110,7 @@ if (( AGG_ENABLE )); then
   load1=${la[2]:-0}
   per_core=$(( load1 / ncpu ))
 
-  AGG_SUSTAIN_CHECKS=$(( (AGG_SUSTAIN_MIN * 60 + WATCHDOG_INTERVAL_SEC - 1) / WATCHDOG_INTERVAL_SEC ))
-  (( AGG_SUSTAIN_CHECKS < 1 )) && AGG_SUSTAIN_CHECKS=1
+  sustain_checks $AGG_SUSTAIN_MIN; AGG_SUSTAIN_CHECKS=$REPLY
   AGG_RENOTIFY_EVERY=$(( AGG_SUSTAIN_CHECKS * 4 ))
 
   if (( per_core >= AGG_LOAD_PER_CORE )); then
