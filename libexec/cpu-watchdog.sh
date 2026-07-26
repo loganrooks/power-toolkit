@@ -7,9 +7,13 @@ set -u
 PT_ROOT=${0:A:h:h}; source "$PT_ROOT/config.sh"
 zmodload zsh/datetime 2>/dev/null
 mkdir -p "$PT_LOG"
-STATE="$PT_VAR/cpu-state.tsv"            # pid \t hotcount \t notedcount \t comm
-AGG_STATE="$PT_VAR/cpu-agg-state"        # streak \t noted
-LOG="$PT_LOG/watchdog.log"
+# Paths and the ps source honor optional CPU_*_OVERRIDE env (unset in production / launchd) so
+# the state-validity guards can be tested deterministically without waiting for a real runaway.
+# Mirrors the MEM_*_OVERRIDE hooks the memory guardian already uses.
+STATE="${CPU_STATE_OVERRIDE:-$PT_VAR/cpu-state.tsv}"       # pid \t hotcount \t notedcount \t comm \t start
+AGG_STATE="${CPU_AGG_STATE_OVERRIDE:-$PT_VAR/cpu-agg-state}"   # streak \t noted \t last_sample_epoch
+LOG="${CPU_LOG_OVERRIDE:-$PT_LOG/watchdog.log}"
+pt_rotate_log "$LOG"     # bound the history; see PT_LOG_MAX_KB in config.sh
 
 # N observations spaced WATCHDOG_INTERVAL_SEC apart span (N-1)*interval of ELAPSED time, not
 # N*interval. Both the threshold and the reported duration were off by one interval: the
@@ -47,7 +51,7 @@ mins_for() { print -- $(( ($1 - 1) * WATCHDOG_INTERVAL_SEC / 60 )); }   # elapse
 # discard BOTH state files when it changes — the per-process state has the identical defect
 # (HOT counts survive a CPU_THRESHOLD or SUSTAIN_MIN edit), so one mechanism covers the class.
 # (Codex round 2 on PR #2, flagged for the aggregate state only.)
-POLICY_FILE="$PT_VAR/cpu-policy"
+POLICY_FILE="${CPU_POLICY_OVERRIDE:-$PT_VAR/cpu-policy}"
 POLICY="v1|$WATCHDOG_INTERVAL_SEC|$CPU_THRESHOLD|$SUSTAIN_MIN|$AGG_ENABLE|$AGG_LOAD_PER_CORE|$AGG_SUSTAIN_MIN|$AGG_MIN_PROC_CPU"
 if [[ "$(cat "$POLICY_FILE" 2>/dev/null)" != "$POLICY" ]]; then
   [[ -f "$STATE" || -f "$AGG_STATE" ]] && \
@@ -56,10 +60,26 @@ if [[ "$(cat "$POLICY_FILE" 2>/dev/null)" != "$POLICY" ]]; then
   print -- "$POLICY" > "$POLICY_FILE"
 fi
 
-typeset -A HOT NOTED
+# A streak is only meaningful if the samples behind it are CONSECUTIVE. Sleep, a reboot, or an
+# unloaded agent leaves the old streak on disk with no record of when it was last touched, so
+# one high-load sample before the gap and one after satisfy a two-observation window instantly —
+# "5 sustained minutes" spanning a weekend. Anything beyond ~1.5 intervals is a missed poll.
+# (Codex round 3 on PR #2, filed against the aggregate state; the per-process HOT counts have
+# the identical defect, so the expiry covers both.)
+STALE_AFTER=$(( WATCHDOG_INTERVAL_SEC * 3 / 2 ))
+LAST_SAMPLE=0
+[[ -f "$AGG_STATE" ]] && LAST_SAMPLE=$(cut -f3 "$AGG_STATE" 2>/dev/null)
+[[ "$LAST_SAMPLE" == <-> ]] || LAST_SAMPLE=0
+GAP=$(( EPOCHSECONDS - LAST_SAMPLE ))
+if (( LAST_SAMPLE > 0 && GAP > STALE_AFTER )); then
+  print -- "$(ts) GAP    ${GAP}s since the last sample (> ${STALE_AFTER}s) — discarding streaks" >> "$LOG"
+  rm -f "$STATE" "$AGG_STATE"
+fi
+
+typeset -A HOT NOTED PSTART
 if [[ -f "$STATE" ]]; then
-  while IFS=$'\t' read -r pid hc nt cm; do
-    [[ -n "$pid" ]] && { HOT[$pid]=$hc; NOTED[$pid]=$nt; }
+  while IFS=$'\t' read -r pid hc nt cm st; do
+    [[ -n "$pid" ]] && { HOT[$pid]=$hc; NOTED[$pid]=$nt; PSTART[$pid]=${st:--1}; }
   done < "$STATE"
 fi
 
@@ -67,9 +87,24 @@ fi
 # shell-outs). See the aggregate gate after the loop.
 typeset -A AGGCPU AGGCNT
 AGG_TOTAL=0; AGG_MAXPROC=0; AGG_PERPROC_FIRED=0
+AGG_ALLOWLISTED=0        # summed %CPU attributable to ALERT_ALLOWLIST batch daemons
+
+# etime rides along on the SAME ps (one scan per tick, GOAL_CONTRACT §4) so history can be keyed
+# on process IDENTITY rather than on the PID alone.
+etime_sec() {            # $1 = ps etime -> REPLY seconds. SS | MM:SS | HH:MM:SS | DD-HH:MM:SS
+  local e=$1 d=0 p
+  [[ $e == *-* ]] && { d=${e%%-*}; e=${e#*-} }
+  local -a p; p=( ${(s.:.)e} )
+  case ${#p} in
+    3) REPLY=$(( p[1]*3600 + p[2]*60 + p[3] ));;
+    2) REPLY=$(( p[1]*60 + p[2] ));;
+    *) REPLY=$(( e ));;
+  esac
+  REPLY=$(( d*86400 + REPLY ))
+}
 
 : > "$STATE.tmp"
-while read -r pid cpu comm; do
+while read -r pid cpu etime comm; do
   [[ -n "$pid" && -n "$cpu" ]] || continue
 
   # --- aggregate accounting: EVERY process, before the per-process gates below ---
@@ -78,11 +113,27 @@ while read -r pid cpu comm; do
     AGGCPU[$comm]=$(( ${AGGCPU[$comm]:-0} + cpu ))
     AGGCNT[$comm]=$(( ${AGGCNT[$comm]:-0} + 1 ))
     (( cpu > AGG_MAXPROC )) && AGG_MAXPROC=$cpu
+    for a in ${=ALERT_ALLOWLIST}; do
+      [[ "$comm" == *$a* ]] && { AGG_ALLOWLISTED=$(( AGG_ALLOWLISTED + cpu )); break }
+    done
   fi
 
   (( cpu >= CPU_THRESHOLD )) || continue
   kill -0 "$pid" 2>/dev/null || continue
   for a in ${=ALERT_ALLOWLIST}; do [[ "$comm" == *$a* ]] && continue 2; done   # skip expected daemons
+
+  # PID REUSE: a PID is unique only among LIVE processes. macOS recycles them, so keying the
+  # streak on the PID alone lets a fresh process inherit a dead one's hotcount and cross
+  # SUSTAIN_CHECKS on its first tick — and in aggressive mode (AUTO_KILL=1) that is a SIGTERM
+  # to the wrong process on evidence it never earned. Identity is (pid, start); start comes
+  # from etime on the same ps. 5s tolerance absorbs etime resolution and snapshot drift.
+  # (Codex F5 on PR #2 — the mem-watchdog twin was fixed the same way on PR #1.)
+  etime_sec "$etime"; start=$(( EPOCHSECONDS - REPLY ))
+  prev_start=${PSTART[$pid]:--1}
+  if (( prev_start >= 0 )); then
+    d=$(( start - prev_start )); (( d < 0 )) && d=$(( -d ))
+    if (( d > 5 )); then unset "HOT[$pid]" "NOTED[$pid]"; else start=$prev_start; fi
+  fi
 
   count=$(( ${HOT[$pid]:-0} + 1 ))
   noted=${NOTED[$pid]:-0}
@@ -114,8 +165,9 @@ while read -r pid cpu comm; do
       (( skip )) || { kill -TERM "$pid" 2>/dev/null && print -- "$(ts) KILLED $msg" >> "$LOG"; }
     fi
   fi
-  printf '%s\t%s\t%s\t%s\n' "$pid" "$count" "$noted" "$comm" >> "$STATE.tmp"
-done < <(ps -arcwwwxo pid=,%cpu=,comm=)
+  printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$count" "$noted" "$comm" "$start" >> "$STATE.tmp"
+done < <(if [[ -n "${CPU_PS_SOURCE:-}" && -r "${CPU_PS_SOURCE}" ]]; then cat "$CPU_PS_SOURCE"
+         else ps -arcwwwxo pid=,%cpu=,etime=,comm=; fi)
 
 mv "$STATE.tmp" "$STATE"
 
@@ -127,7 +179,7 @@ mv "$STATE.tmp" "$STATE"
 if (( AGG_ENABLE )); then
   agg_streak=0; agg_noted=0
   if [[ -f "$AGG_STATE" ]]; then
-    IFS=$'\t' read -r agg_streak agg_noted < "$AGG_STATE"
+    IFS=$'\t' read -r agg_streak agg_noted agg_last < "$AGG_STATE"   # 3rd field or agg_noted eats it
     [[ -n "$agg_streak" ]] || agg_streak=0
     [[ -n "$agg_noted" ]] || agg_noted=0
   fi
@@ -154,9 +206,20 @@ if (( AGG_ENABLE )); then
             | awk -F'\t' '{printf "%d×%s@%.0f%% ", $2, $3, $1}')
       msg="load $(printf '%.1f' $load1) on ${ncpu} cores ($(printf '%.1f' $per_core)/core) for ~$(mins_for $agg_streak)+ min; summed %CPU=$(printf '%.0f' $AGG_TOTAL), hottest single proc=$(printf '%.0f' $AGG_MAXPROC)% — top: ${top}"
 
+      # ALERT_ALLOWLIST exists so that Spotlight, backup and media-analysis daemons pegging a
+      # core do not page the operator. The per-process gate skips them; the aggregate gate used
+      # to ignore the list entirely, so the SAME indexing workload came back as an
+      # AGG-DISTRIBUTED "runaway" — defeating the allowlist for exactly the multi-process batch
+      # jobs this gate observes. If most of the load is attributable to allowlisted daemons, log
+      # it and stay quiet. (Codex round 3 on PR #2.)
+      agg_allow_pct=0
+      (( AGG_TOTAL > 0 )) && agg_allow_pct=$(( 100 * AGG_ALLOWLISTED / AGG_TOTAL ))
+
       if (( AGG_PERPROC_FIRED )); then
         # A per-process alert already named a culprit this tick; log only, don't double-notify.
         print -- "$(ts) AGG    $msg" >> "$LOG"
+      elif (( agg_allow_pct >= AGG_ALLOWLIST_PCT )); then
+        print -- "$(ts) AGG-EXPECTED  ${agg_allow_pct}% of load is ALERT_ALLOWLIST batch work — $msg" >> "$LOG"
       else
         # The blind-spot signature: system saturated, yet nothing crossed CPU_THRESHOLD.
         print -- "$(ts) AGG-DISTRIBUTED  $msg" >> "$LOG"
@@ -167,5 +230,5 @@ if (( AGG_ENABLE )); then
   else
     agg_streak=0; agg_noted=0
   fi
-  printf '%s\t%s\n' "$agg_streak" "$agg_noted" > "$AGG_STATE"
+  printf '%s\t%s\t%s\n' "$agg_streak" "$agg_noted" "$EPOCHSECONDS" > "$AGG_STATE"
 fi

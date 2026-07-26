@@ -50,6 +50,10 @@ AGG_SUSTAIN_MIN=10               # sustained minutes above threshold before aler
 AGG_TOP_N=5                      # how many top contributor groups to name in the alert
 AGG_MIN_PROC_CPU=1               # ignore procs below this %CPU when grouping (cost control:
                                  # skips ~850 idle procs/tick; they cannot cause an overload)
+AGG_ALLOWLIST_PCT=60             # if at least this %% of the summed load is ALERT_ALLOWLIST batch
+                                 # work (Spotlight, backupd, mediaanalysisd...), log AGG-EXPECTED
+                                 # and stay quiet. Without this the aggregate gate re-reported the
+                                 # very indexing workloads ALERT_ALLOWLIST exists to silence.
 
 # ---------- memory guardian (mem-watchdog) ----------
 # Adaptive, pressure-aware RSS watchdog over ALL processes (the rg-to-17GB swap-exhaustion
