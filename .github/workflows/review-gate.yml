@@ -1,22 +1,54 @@
 name: review-gate
 
-# Enforces the part of review hygiene GitHub cannot express natively:
-# every reviewer thread must be REPLIED TO and REACTED TO, not merely resolved.
-# (Thread *resolution* is enforced by the repo ruleset — see docs/review-gates.md.)
+# Enforces the part of review hygiene GitHub cannot express natively: every reviewer thread
+# must be REPLIED TO and REACTED TO, not merely resolved. (Resolution itself is enforced by
+# the repo ruleset — see docs/review-gates.md.)
 #
-# The verdict is published as a COMMIT STATUS named `review-gate` on the PR head SHA,
-# which is what the ruleset requires. The workflow job itself always exits 0 on a clean
-# evaluation so there is exactly ONE red thing to look at when the gate is unmet.
+# The verdict is published as a COMMIT STATUS named `review-gate` on the PR head SHA, which is
+# what the ruleset requires. The job exits 0 on a clean evaluation so there is exactly ONE red
+# thing to look at when the gate is unmet.
 #
-# Trigger choice is load-bearing: `pull_request_target`, `pull_request_review`,
-# `pull_request_review_comment` and `issue_comment` ALL resolve the workflow file from the
-# DEFAULT branch. That is why this gate works on stacked PRs whose base branch predates it,
-# and why plain `pull_request` is deliberately not used. Nothing from the head branch is
-# ever checked out or executed here — this job reads PR metadata and writes a status.
+# SCOPE — this gate binds pull requests that target the DEFAULT branch, and only those.
+#   `pull_request_review` and `pull_request_review_comment` fire only when a PR's base is the
+#   default branch (measured on this repo 2026-07-26: a Codex review and two human replies on
+#   a stacked PR produced no run at all; the identical events on a main-based PR fired
+#   immediately). So a stacked PR cannot be kept current by events, and the ruleset therefore
+#   does NOT protect stacked bases — a required check that cannot be refreshed is a check that
+#   silently passes.
+#
+#   An earlier version tried to cover stacked PRs with a */10 cron sweeping every open PR.
+#   Four review rounds found races, rate-limit ceilings and coverage holes in it, several
+#   introduced by the fixes for the previous round's. It was removed rather than patched a
+#   fifth time. Stacked PRs still receive an ADVISORY status here; they become gate-bound the
+#   moment they are retargeted at the default branch, which is when it can actually be honest.
+#
+#   All triggers below resolve the workflow file from the DEFAULT branch, so the gate also
+#   covers PRs whose base branch predates it. Plain `pull_request` would resolve from the head
+#   branch and silently not run.
+#
+# `edited` is in the pull_request_target types deliberately: it is what fires when a stacked PR
+# is RETARGETED at the default branch. Without it that PR would carry its last advisory status
+# — quite possibly a stale green from before any review — into a branch where the ruleset now
+# enforces it.
+#
+# THE INVARIANT — read this before editing anything below.
+#   A required status that is not freshly written KEEPS ITS PREVIOUS VALUE, and that value is
+#   `success` in every case that matters, because a PR is green at open time before any
+#   reviewer has commented. So every quiet failure here is a fail-OPEN.
+#
+#   Loud is NOT the same as closed. An earlier version of this file claimed that exiting
+#   non-zero discharged the obligation; it does not. The ruleset gates on the `review-gate`
+#   COMMIT STATUS, not on this job, so a red workflow run informs the operator while the PR
+#   stays green and mergeable. Anything that must actually block has to reach the status.
+#   Therefore: on any failure to establish a verdict, write `failure` to the status if a SHA is
+#   known, and only then exit non-zero.
+#
+# Nothing from the head branch is ever checked out or executed: this job reads PR metadata and
+# writes a commit status.
 
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review, edited]
   pull_request_review:
     types: [submitted, edited, dismissed]
   pull_request_review_comment:
@@ -36,7 +68,7 @@ permissions:
 
 concurrency:
   group: review-gate-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   gate:
@@ -49,6 +81,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python3 - <<'PY'
@@ -57,6 +90,7 @@ jobs:
           repo = os.environ["REPO"]
           owner, name = repo.split("/")
           pr = int(os.environ["PR"])
+          default_branch = os.environ.get("DEFAULT_BRANCH", "")
           run_url = os.environ["RUN_URL"]
 
           QUERY = """
@@ -64,6 +98,7 @@ jobs:
             repository(owner:$owner,name:$name){
               pullRequest(number:$num){
                 headRefOid
+                baseRefName
                 author{login}
                 reviewThreads(first:100){
                   pageInfo{hasNextPage}
@@ -91,17 +126,12 @@ jobs:
           }
           """
 
-          proc = subprocess.run(
-              ["gh", "api", "graphql", "-f", "query=" + QUERY,
-               "-f", "owner=" + owner, "-f", "name=" + name, "-F", "num=%d" % pr],
-              capture_output=True, text=True)
-          if proc.returncode != 0:
-              sys.stderr.write(proc.stderr)
-              sys.exit("review-gate: GraphQL query failed; refusing to publish a verdict")
-
-          data = json.loads(proc.stdout)["data"]["repository"]["pullRequest"]
-          sha = data["headRefOid"]
-          pr_author = (data["author"] or {}).get("login")
+          def gh(args):
+              proc = subprocess.run(["gh"] + args, capture_output=True, text=True)
+              if proc.returncode != 0:
+                  sys.stderr.write(proc.stderr)
+                  return None
+              return proc.stdout
 
           def reactions(node):
               return sum(g["reactors"]["totalCount"] for g in (node.get("reactionGroups") or []))
@@ -109,14 +139,40 @@ jobs:
           def login(node):
               return ((node or {}).get("author") or {}).get("login")
 
+          def publish(sha, state, description):
+              """Write the verdict, unless an identical one is already the current status.
+
+              GitHub caps commit statuses at 1000 per SHA per context. The dedupe keeps a
+              chatty PR from spending that on repeats of a verdict nobody changed — after
+              which a green SHA could never be turned red. Correctness, not tidiness.
+              """
+              current = gh(["api", "repos/%s/commits/%s/status" % (repo, sha),
+                            "--jq", '[.statuses[] | select(.context=="review-gate")][0].state // ""'])
+              if current is not None and current.strip() == state:
+                  return True
+              return gh(["api", "repos/%s/statuses/%s" % (repo, sha),
+                         "-f", "state=" + state,
+                         "-f", "context=review-gate",
+                         "-f", "description=" + description[:139],
+                         "-f", "target_url=" + run_url]) is not None
+
+          out = gh(["api", "graphql", "-f", "query=" + QUERY,
+                    "-f", "owner=" + owner, "-f", "name=" + name, "-F", "num=%d" % pr])
+          if out is None:
+              # No verdict, and therefore no SHA to mark. Nothing can be written; exit loudly.
+              sys.exit("review-gate: GraphQL query failed for PR %d; status NOT refreshed" % pr)
+
+          data = json.loads(out)["data"]["repository"]["pullRequest"]
+          sha = data["headRefOid"]
+          pr_author = (data["author"] or {}).get("login")
+          advisory = bool(default_branch) and data["baseRefName"] != default_branch
           unmet = []
 
           # Truncation guard: an unseen thread must never read as a satisfied one.
           for field in ("reviewThreads", "reviews", "comments"):
               if data[field]["pageInfo"]["hasNextPage"]:
-                  unmet.append(
-                      "%s exceeds the 100-item query window — the gate cannot see everything on "
-                      "this PR. Split it, or paginate this workflow." % field)
+                  unmet.append("%s exceeds the 100-item query window — the gate cannot see "
+                               "everything on this PR. Split it, or paginate this workflow." % field)
 
           # 1. Inline review threads: reply + reaction + resolution.
           for thread in data["reviewThreads"]["nodes"]:
@@ -159,25 +215,28 @@ jobs:
               description = "%d reviewer thread(s) not replied to / reacted to / resolved" % len(unmet)
           else:
               description = "every reviewer thread replied to, reacted to, and resolved"
+          if advisory:
+              # Say so on the status itself. A green badge on a PR the gate cannot keep current
+              # is exactly the thing this whole file exists to stop being silent about.
+              description = "ADVISORY (base is not %s, not gate-bound) — %s" % (default_branch, description)
 
-          summary = ["# review-gate — `%s`" % state, "", "PR #%d @ `%s`" % (pr, sha[:7]), ""]
+          summary = ["# review-gate — `%s`%s" % (state, " *(advisory)*" if advisory else ""), "",
+                     "PR #%d @ `%s`, base `%s`" % (pr, sha[:7], data["baseRefName"]), ""]
+          if advisory:
+              summary += ["> This PR does not target `%s`, so review events do not fire for it "
+                          "and this status cannot be kept current. It is informational until the "
+                          "PR is retargeted." % default_branch, ""]
           if unmet:
-              summary.append("Unmet obligations:")
-              summary.append("")
-              summary.extend("- %s" % u for u in unmet)
+              summary += ["Unmet obligations:", ""] + ["- %s" % u for u in unmet]
               summary += ["", "A verdict block belongs on every reply — see `docs/review-gates.md`."]
           else:
               summary.append("No outstanding reviewer obligations.")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
               fh.write("\n".join(summary) + "\n")
 
-          subprocess.run(
-              ["gh", "api", "repos/%s/statuses/%s" % (repo, sha),
-               "-f", "state=" + state,
-               "-f", "context=review-gate",
-               "-f", "description=" + description[:139],
-               "-f", "target_url=" + run_url],
-              check=True)
+          if not publish(sha, state, description):
+              sys.exit("review-gate: could not publish status for PR %d; it is STALE" % pr)
 
-          print("review-gate: %s (%d unmet)" % (state, len(unmet)))
+          print("review-gate: PR #%d %s (%d unmet%s)"
+                % (pr, state, len(unmet), ", advisory" if advisory else ""))
           PY

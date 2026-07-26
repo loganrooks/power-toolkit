@@ -4,12 +4,9 @@
   "enforcement": "active",
   "conditions": {
     "ref_name": {
+      "_comment": "THE DEFAULT BRANCH ONLY, and deliberately nothing else. Do not add a stacked PR's base branch here, and do not add a glob: (a) these rules gate PUSHES to any matching ref, so `refs/heads/feat/**` would make every feature branch reject your own commits with GH013; (b) review events do not fire for PRs based on anything but the default branch, so the review-gate status on such a PR cannot be kept current — protecting its base would create a REQUIRED check that silently passes, which is worse than no check. Stacked PRs get an advisory status and become gate-bound when retargeted at the default branch. Keys prefixed with _ are stripped before submission; the API rejects unrecognised parameters with a 422.",
       "include": [
-        "~DEFAULT_BRANCH",
-        "refs/heads/feat/**",
-        "refs/heads/fix/**",
-        "refs/heads/chore/**",
-        "refs/heads/docs/**"
+        "~DEFAULT_BRANCH"
       ],
       "exclude": []
     }
