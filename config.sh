@@ -14,16 +14,42 @@ SAVER_LABEL="$PT_LABEL_PREFIX.power-saver"
 SLEEPWATCHER_LABEL="$PT_LABEL_PREFIX.sleepwatcher"
 MEM_WATCHDOG_LABEL="$PT_LABEL_PREFIX.mem-watchdog"
 
+# ---------- kill-safety (GOAL_CONTRACT §4) — ONE list, consumed by BOTH watchdogs ----------
+# Never SIGTERM/SIGKILL, whatever the CPU or RSS. Defined once, here, because the two watchdogs
+# previously carried SEPARATE lists and they drifted: the CPU path's `KILL_ALLOWLIST` omitted
+# claude/codex/cmux, Finder and com.apple.Virtualization, all of which §4 names as untouchable
+# and all of which the memory path already protected. Consequence: in `aggressive` mode
+# (AUTO_KILL=1) the cpu-watchdog would SIGTERM a sustained-hot LIVE Claude Code session — a
+# shipped §4 violation. Found by cross-vendor review 2026-07-26 (review-journal/0001, F4; E-025).
+# Derive both consumers from these two, never re-list members inline.
+PROTECT_SYSTEM="kernel_task WindowServer launchd loginwindow coreaudiod hidd powerd bluetoothd com.apple.Virtualization Finder mds mds_stores mdworker backupd configd securityd opendirectoryd logd UserEventAgent"
+PROTECT_SESSION="claude codex cmux"   # live coding sessions — a guardian must never kill its own
+
 # ---------- defaults (balanced mode) ----------
 # CPU watchdog — catches processes pegging a core continuously (the pyenv-loop failure mode).
 CPU_THRESHOLD=85                 # %CPU; ~100 == one core fully pegged
 SUSTAIN_MIN=15                   # sustained minutes above threshold before alerting
 WATCHDOG_INTERVAL_SEC=300        # how often the watchdog samples
 AUTO_KILL=0                      # 1 = SIGTERM offenders (allowlist always protected)
-KILL_ALLOWLIST="kernel_task WindowServer launchd loginwindow coreaudiod hidd powerd bluetoothd mds mds_stores backupd"
+KILL_ALLOWLIST="$PROTECT_SYSTEM $PROTECT_SESSION"
 # Known heavy-but-legit system daemons (indexing / media analysis / backup) — never even alert;
 # they routinely peg a core doing self-limiting batch work, usually only on AC.
 ALERT_ALLOWLIST="mediaanalysisd photoanalysisd photolibraryd cloudphotod mds mds_stores mdworker mdworker_shared Spotlight backupd XProtect XprotectService corespeechd amplibraryagent AMPDeviceDiscoveryAgent"
+
+# ---------- aggregate ("distributed runaway") gate ----------
+# The per-process gate above is structurally blind to MANY small hogs that each stay under
+# CPU_THRESHOLD. Observed 2026-07-26: 36 orphaned busy-loops at ~22% CPU each — ~800% aggregate,
+# load 142 on 10 cores, 0.0% idle for ~9h — and every one was filtered out at line `cpu >=
+# CPU_THRESHOLD`, so zero alerts fired. This gate watches the SYSTEM, not any single process.
+# DETECTION-ONLY BY DESIGN: an aggregate signal cannot attribute blame (36 orphans and a
+# legitimate `make -j16` share a load signature), so it must never kill. Attributed-kill is a
+# separate, profile-classified design — see goal/briefs/0002 and GOAL_CONTRACT §4 (notify-first).
+AGG_ENABLE=1
+AGG_LOAD_PER_CORE=2.5            # 1-min load avg / ncpu above this = oversubscribed
+AGG_SUSTAIN_MIN=10               # sustained minutes above threshold before alerting
+AGG_TOP_N=5                      # how many top contributor groups to name in the alert
+AGG_MIN_PROC_CPU=1               # ignore procs below this %CPU when grouping (cost control:
+                                 # skips ~850 idle procs/tick; they cannot cause an overload)
 
 # ---------- memory guardian (mem-watchdog) ----------
 # Adaptive, pressure-aware RSS watchdog over ALL processes (the rg-to-17GB swap-exhaustion
@@ -68,10 +94,11 @@ MEM_UNKNOWN_TOL=3;       MEM_UNKNOWN_BASE=256      # conservative; notify-first 
 MEM_AUTOKILL_PROFILES="ephemeral"                  # which classes M1 may auto-kill (opt-in)
 
 # Classification (substring/basename match on the full exec path from `ps -o comm`):
-# Protected/system — the kill-safety list (GOAL_CONTRACT §4). NEVER signalled regardless of RSS.
-MEM_PROTECT="kernel_task WindowServer launchd loginwindow coreaudiod hidd powerd bluetoothd com.apple.Virtualization Finder mds mds_stores mdworker backupd configd securityd opendirectoryd logd UserEventAgent"
-# Live coding-session processes — protected so the guardian can never kill its own session.
-MEM_SESSION_PROTECT="claude codex cmux"
+# Protected/system + live sessions — the kill-safety list (GOAL_CONTRACT §4). NEVER signalled
+# regardless of RSS. Derived from the canonical lists at the top of this file so the CPU and
+# memory paths cannot drift apart again (that drift was the F4 bug).
+MEM_PROTECT="$PROTECT_SYSTEM"
+MEM_SESSION_PROTECT="$PROTECT_SESSION"
 # dev runtimes (medium tolerance) — matched by path basename.
 MEM_DEVRUNTIME="node deno bun python python3 ruby java cargo rustc clangd gopls tsserver"
 # ephemeral CLIs (low tolerance; kill-eligible in M1) — matched by path basename.
@@ -98,13 +125,19 @@ case "$PT_MODE" in
     BT_DROP_AFTER_MIN=15
     PMSET_DESIRED+=( "b womp 0" "b standby 1" )
     MEM_WATCHDOG_INTERVAL_SEC=30             # poll twice as often
+    AGG_LOAD_PER_CORE=2.0                    # flag oversubscription sooner
+    AGG_SUSTAIN_MIN=5
     # NB: M0 is observe-only in every mode — MEM_OBSERVE stays 1 until M1 ships kill code.
+    # NB: the aggregate gate is detection-only in EVERY mode, including aggressive — AUTO_KILL
+    # governs the per-process path only. It has no kill code path at all (brief 0002).
     ;;
   conservative)
     AUTO_KILL=0
     BT_DROP_AFTER_MIN=60
     PMSET_DESIRED=( "b tcpkeepalive 0" )     # minimal touch
     MEM_WATCHDOG_INTERVAL_SEC=120
+    AGG_LOAD_PER_CORE=4.0                    # only flag severe oversubscription
+    AGG_SUSTAIN_MIN=20
     ;;
   balanced|*) ;;                             # use defaults above
 esac

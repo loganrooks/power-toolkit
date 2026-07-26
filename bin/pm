@@ -202,6 +202,16 @@ cmd_status() {
   done
   print; print -- "  Top CPU"
   ps -arcwwwxo pid=,%cpu=,comm= | head -3 | sed 's/^/    /'
+  # "Top CPU" alone hides a saturated machine when load is spread across many sub-threshold
+  # processes (the 2026-07-26 distributed-runaway signature), so show the system view too.
+  local ncpu=$(sysctl -n hw.ncpu) la1 pc
+  la1=$(sysctl -n vm.loadavg | awk '{print $2}')
+  pc=$(( la1 / ncpu ))
+  if (( AGG_ENABLE )) && (( pc >= AGG_LOAD_PER_CORE )); then
+    c_red "$(printf '    load %.1f on %d cores (%.1f/core) — OVERSUBSCRIBED (threshold %.1f/core)' $la1 $ncpu $pc $AGG_LOAD_PER_CORE)"
+  else
+    c_dim "$(printf '    load %.1f on %d cores (%.1f/core)' $la1 $ncpu $pc)"
+  fi
   print; print -- "  Memory headroom"
   if [[ -s "$PT_LOG/mem-watchdog.log" ]]; then
     grep ' TICK ' "$PT_LOG/mem-watchdog.log" | tail -1 | sed 's/^/    /'
