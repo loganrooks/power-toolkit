@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1405" height="941" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">
+<rect width="1405" height="941" rx="10" fill="#0d1117"/>
+<circle cx="26" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="44" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="62" cy="17" r="6" fill="#27c93f"/>
+<text x="702" y="21" fill="#6e7681" font-size="12" text-anchor="middle">pm status</text>
+<text x="18" y="62" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">────────────────────────────────────────────</tspan></text>
+<text x="18" y="83" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">  power-toolkit  ·  mode: balanced</tspan></text>
+<text x="18" y="104" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">────────────────────────────────────────────</tspan></text>
+<text x="18" y="125" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">  Power   </tspan><tspan fill="#e3b341" xml:space="preserve">[████░░░░░░]</tspan><tspan fill="#e3b341" xml:space="preserve"> 39%  ↓ 0.0W  ·  Battery  ·  lid open  ·  bt off</tspan></text>
+<text x="18" y="146" xml:space="preserve"></text>
+<text x="18" y="167" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">  Agents</tspan></text>
+<text x="18" y="188" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">    cpu-watchdog   </tspan><tspan fill="#3fb950" xml:space="preserve">● loaded</tspan></text>
+<text x="18" y="209" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">    mem-watchdog   </tspan><tspan fill="#3fb950" xml:space="preserve">● loaded</tspan></text>
+<text x="18" y="230" xml:space="preserve"><tspan fill="#6e7681" xml:space="preserve">      (observe mode — logs would-be actions, no kills)</tspan></text>
+<text x="18" y="251" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">    power-saver    </tspan><tspan fill="#3fb950" xml:space="preserve">● loaded</tspan></text>
+<text x="18" y="272" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">    sleepwatcher   </tspan><tspan fill="#3fb950" xml:space="preserve">● loaded</tspan></text>
+<text x="18" y="293" xml:space="preserve"></text>
+<text x="18" y="314" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">  pmset (desired → actual)</tspan></text>
+<text x="18" y="335" xml:space="preserve"><tspan fill="#f85149" xml:space="preserve">    -b tcpkeepalive want 0, have 1  (run: pm apply)</tspan></text>
+<text x="18" y="356" xml:space="preserve"><tspan fill="#f85149" xml:space="preserve">    -b powernap want 0, have 1  (run: pm apply)</tspan></text>
+<text x="18" y="377" xml:space="preserve"><tspan fill="#3fb950" xml:space="preserve">    -c tcpkeepalive = 1</tspan></text>
+<text x="18" y="398" xml:space="preserve"><tspan fill="#3fb950" xml:space="preserve">    -c powernap = 1</tspan></text>
+<text x="18" y="419" xml:space="preserve"></text>
+<text x="18" y="440" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">  Top CPU</tspan></text>
+<text x="18" y="461" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">    97261  23.0 claude</tspan></text>
+<text x="18" y="482" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">    96743  17.6 Terminal</tspan></text>
+<text x="18" y="503" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">     3958  15.0 pkd</tspan></text>
+<text x="18" y="524" xml:space="preserve"><tspan fill="#6e7681" xml:space="preserve">    load 7.5 on 10 cores (0.8/core)</tspan></text>
+<text x="18" y="545" xml:space="preserve"></text>
+<text x="18" y="566" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">  Memory headroom</tspan></text>
+<text x="18" y="587" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">    2026-07-26 15:59:34 TICK headroom=healthy press=1 free=54% swap=2769M(d-8) procs=675 top=hybridsearchd:0.71</tspan></text>
+<text x="18" y="608" xml:space="preserve"></text>
+<text x="18" y="629" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">  Top RSS</tspan></text>
+<text x="18" y="650" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">       978M   /System/Volumes/Preboot/Cryptexes/App/System/Applications/Safari.app/Contents/MacOS/Safari</tspan></text>
+<text x="18" y="671" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">       368M   claude</tspan></text>
+<text x="18" y="692" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">       307M   claude</tspan></text>
+<text x="18" y="713" xml:space="preserve"></text>
+<text x="18" y="734" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">  Recent mem would-actions</tspan></text>
+<text x="18" y="755" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">    2026-07-03 01:55:04 WOULD-NOTIFY ugrep                      pid=82778  rss=2670M ratio=10.4 growth=11.9MB/s streak=1 risk=7.33 profile=unknown headroom=caution</tspan></text>
+<text x="18" y="776" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">    2026-07-03 01:56:04 WOULD-NOTIFY ugrep                      pid=82778  rss=3582M ratio=14.0 growth=15.2MB/s streak=2 risk=9.61 profile=unknown headroom=caution</tspan></text>
+<text x="18" y="797" xml:space="preserve"></text>
+<text x="18" y="818" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">  Recent cpu-watchdog alerts</tspan></text>
+<text x="18" y="839" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">    2026-07-26 13:24:59 POLICY change — discarding accumulated streaks (v1|300|85|15|1|2.5|10|1)</tspan></text>
+<text x="18" y="860" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">    2026-07-26 13:24:59 POLICY change — discarding accumulated streaks (v1|300|85|15|1|2.0|5|1)</tspan></text>
+<text x="18" y="881" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">    2026-07-26 13:25:20 POLICY change — discarding accumulated streaks (v1|300|85|15|1|2.5|10|1)</tspan></text>
+<text x="18" y="902" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">────────────────────────────────────────────</tspan></text>
+</svg>
