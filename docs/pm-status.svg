@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="649" height="566" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">
+<rect width="649" height="566" rx="10" fill="#0d1117"/>
+<circle cx="26" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="44" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="62" cy="17" r="6" fill="#27c93f"/>
+<text x="324" y="21" fill="#6e7681" font-size="12" text-anchor="middle">pm status</text>
+<text x="18" y="62" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">────────────────────────────────────────────</tspan></text>
+<text x="18" y="83" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">  power-toolkit  ·  mode: balanced</tspan></text>
+<text x="18" y="104" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">────────────────────────────────────────────</tspan></text>
+<text x="18" y="125" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">  Power   </tspan><tspan fill="#e3b341" xml:space="preserve">[█████░░░░░]</tspan><tspan fill="#c9d1d9" xml:space="preserve"> 45%  ↑ charging 28.6W  ·  AC  ·  lid open  ·  bt ?</tspan></text>
+<text x="18" y="146" xml:space="preserve"></text>
+<text x="18" y="167" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">  Agents</tspan></text>
+<text x="18" y="188" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">    watchdog       </tspan><tspan fill="#3fb950" xml:space="preserve">● loaded</tspan></text>
+<text x="18" y="209" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">    power-saver    </tspan><tspan fill="#3fb950" xml:space="preserve">● loaded</tspan></text>
+<text x="18" y="230" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">    sleepwatcher   </tspan><tspan fill="#3fb950" xml:space="preserve">● loaded</tspan></text>
+<text x="18" y="251" xml:space="preserve"></text>
+<text x="18" y="272" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">  pmset (desired → actual)</tspan></text>
+<text x="18" y="293" xml:space="preserve"><tspan fill="#f0726f" xml:space="preserve">    -b tcpkeepalive want 0, have 1  (run: pm apply)</tspan></text>
+<text x="18" y="314" xml:space="preserve"><tspan fill="#f0726f" xml:space="preserve">    -b powernap want 0, have 1  (run: pm apply)</tspan></text>
+<text x="18" y="335" xml:space="preserve"><tspan fill="#3fb950" xml:space="preserve">    -c tcpkeepalive = 1</tspan></text>
+<text x="18" y="356" xml:space="preserve"><tspan fill="#3fb950" xml:space="preserve">    -c powernap = 1</tspan></text>
+<text x="18" y="377" xml:space="preserve"></text>
+<text x="18" y="398" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">  Top CPU</tspan></text>
+<text x="18" y="419" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">    83242  29.9 XprotectService</tspan></text>
+<text x="18" y="440" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">    83252  24.5 ReportMemoryException</tspan></text>
+<text x="18" y="461" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">      391  23.7 WindowServer</tspan></text>
+<text x="18" y="482" xml:space="preserve"></text>
+<text x="18" y="503" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">  Recent watchdog alerts</tspan></text>
+<text x="18" y="524" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">    (none)</tspan></text>
+<text x="18" y="545" xml:space="preserve"><tspan fill="#c9d1d9" xml:space="preserve">────────────────────────────────────────────</tspan></text>
+</svg>
