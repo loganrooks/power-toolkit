@@ -4,6 +4,11 @@
 #   .github/scripts/bootstrap-review-gates.sh                    # this repo
 #   .github/scripts/bootstrap-review-gates.sh owner/other-repo   # somewhere else
 #   CHECKS='build,test' .github/scripts/bootstrap-review-gates.sh owner/other-repo
+#   MERGE_TARGETS='feat/my-stack-base' .github/scripts/bootstrap-review-gates.sh owner/repo
+#
+# MERGE_TARGETS names extra branches to protect as PR bases — the base of an open stacked PR.
+# It is per-invocation, never baked into the shipped JSON, because a branch name from this
+# repository is meaningless in someone else's and would leave their real stack bases open.
 #
 # Installs, in the target repo:
 #   1. .github/workflows/review-gate.yml  — reply+react enforcement, pushed to the DEFAULT
@@ -56,7 +61,12 @@ if [[ -n "$EXISTING_SHA" && "$REMOTE_B64" == "$LOCAL_B64" ]]; then
 elif put_file "$DEFAULT_BRANCH" "$MSG"; then
   echo "    workflow: written to $DEFAULT_BRANCH"
 else
-  BR=chore/review-gate-bootstrap
+  # Deliberately UNPREFIXED. The ruleset shipped in the previous version globbed
+  # refs/heads/{feat,fix,chore,docs}/** with no bypass actors, so a `chore/`-prefixed fallback
+  # branch is rejected by the very installations this fallback exists to upgrade — the same
+  # wall as the direct write, one level down. Any new prefix here must be checked against the
+  # OLD ruleset's globs, not the current one.
+  BR=review-gate-bootstrap
   HEAD_SHA=$(gh api "repos/$TARGET/git/ref/heads/$DEFAULT_BRANCH" --jq .object.sha)
   gh api -X POST "repos/$TARGET/git/refs" -f "ref=refs/heads/$BR" -f "sha=$HEAD_SHA" >/dev/null 2>&1 || true
   EXISTING_SHA=$(gh api "repos/$TARGET/contents/$REMOTE_PATH?ref=$BR" --jq .sha 2>/dev/null || true)
@@ -80,20 +90,37 @@ if [[ -n "${WORKFLOW_PENDING:-}" ]]; then
 fi
 
 # CHECKS lets a repo with different CI job names reuse this without editing the JSON.
-PAYLOAD=$(cat "$RULESET")
-if [[ -n "${CHECKS:-}" ]]; then
-  PAYLOAD=$(CHECKS="$CHECKS" python3 -c '
+# The rulesets API rejects ANY unrecognised key — `Unexpected parameter '_comment'`, 422, on
+# both POST and PUT — so documentation cannot ride along in the payload. JSON has no comment
+# syntax and the explanation genuinely belongs next to the field it explains, so `_`-prefixed
+# keys are stripped recursively here instead of being banned from the file.
+PAYLOAD=$(CHECKS="${CHECKS:-}" MERGE_TARGETS="${MERGE_TARGETS:-}" python3 -c '
 import json, os, sys
-p = json.load(sys.stdin)
-want = [c.strip() for c in os.environ["CHECKS"].split(",") if c.strip()]
-if "review-gate" not in want:
-    want.append("review-gate")
-for rule in p["rules"]:
-    if rule["type"] == "required_status_checks":
-        rule["parameters"]["required_status_checks"] = [{"context": c} for c in want]
+def strip(o):
+    if isinstance(o, dict):  return {k: strip(v) for k, v in o.items() if not k.startswith("_")}
+    if isinstance(o, list):  return [strip(v) for v in o]
+    return o
+p = strip(json.load(sys.stdin))
+
+want = [c.strip() for c in os.environ.get("CHECKS", "").split(",") if c.strip()]
+if want:
+    if "review-gate" not in want:
+        want.append("review-gate")
+    for rule in p["rules"]:
+        if rule["type"] == "required_status_checks":
+            rule["parameters"]["required_status_checks"] = [{"context": c} for c in want]
+
+# Stacked-PR bases are per-repository, so they are supplied per invocation and never baked
+# into the shipped JSON. Bare names are accepted and normalised.
+extra = [t.strip() for t in os.environ.get("MERGE_TARGETS", "").split(",") if t.strip()]
+inc = p["conditions"]["ref_name"]["include"]
+for t in extra:
+    ref = t if t.startswith(("refs/", "~")) else "refs/heads/" + t
+    if ref not in inc:
+        inc.append(ref)
+
 json.dump(p, sys.stdout)
-' <<<"$PAYLOAD")
-fi
+' < "$RULESET")
 
 EXISTING_ID=$(gh api "repos/$TARGET/rulesets" --jq '.[] | select(.name=="review-gate") | .id' 2>/dev/null || true)
 if [[ -n "$EXISTING_ID" ]]; then

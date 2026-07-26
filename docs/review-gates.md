@@ -93,6 +93,8 @@ the rule is written down rather than left implicit:
 | PR listing was unpaginated | PRs 101+ never evaluated, and the count guard could not miss what it never listed |
 | Commit-status quota | 1000 per SHA per context; a `*/10` sweep republishing an unchanged verdict burns 144/day and exhausts it in under 7 days — after which a green SHA **can never be turned red** |
 | GraphQL 100-item window | threads past the window unseen |
+| Sweep/event race | both publish for the same PR; an older sweep snapshot could overwrite a newer `failure` with `success` |
+| Sweep API budget | 6 sweeps/hr × N PRs against ~1000 GraphQL points/hr; past ~150 open PRs the tail is rate-limited and keeps stale statuses |
 
 **The rule for anyone editing this workflow:** any condition that prevents establishing *or*
 publishing a verdict must make the run loud — a `failure` status where there is a SHA to write
@@ -102,6 +104,15 @@ reported as success.
 The quota fix is why `publish()` skips writing when the current status already carries the
 same state. That dedupe is a correctness requirement, not an optimisation.
 
+The race fix is `strictly_newer()`: a sweep re-reads the PR's `updated_at` before publishing
+and defers only when the PR can be **positively** shown to have moved. Every ambiguous case —
+parse failure, missing value, format surprise — falls through to publishing, because
+abstaining leaves a stale status and stale means green. The safe default is to write.
+
+The budget fix orders stacked PRs first, since they have no event coverage at all, caps the
+sweep at 150, and then **exits non-zero naming every PR it skipped**. A cap nobody reports
+reads as full coverage.
+
 **Residual risk, not closed:** if the statuses API itself is unavailable, a green SHA cannot be
 turned red at all. The run fails visibly and the next sweep retries, so exposure is bounded by
 API availability — but it is real and is not engineered away.
@@ -110,8 +121,18 @@ API availability — but it is real and is not engineered away.
 
 ```bash
 .github/scripts/bootstrap-review-gates.sh owner/other-repo
-CHECKS='build,test' .github/scripts/bootstrap-review-gates.sh owner/other-repo   # different CI jobs
+CHECKS='build,test' .github/scripts/bootstrap-review-gates.sh owner/other-repo        # different CI jobs
+MERGE_TARGETS='feat/their-stack-base' .github/scripts/bootstrap-review-gates.sh owner/other-repo
 ```
+
+`MERGE_TARGETS` names extra branches to protect as PR bases. It is **per-invocation and never
+baked into the shipped JSON** — a stacked-base branch name from this repository is meaningless
+in someone else's, and hardcoding it would protect a name that does not exist there while
+leaving their real stack bases open. This repo's own ruleset is reproduced with
+`MERGE_TARGETS='feat/mem-watchdog-m0-observe'`.
+
+`_`-prefixed keys in the ruleset JSON are documentation and are stripped before submission;
+the API rejects any unrecognised parameter with a 422.
 
 Idempotent: re-running updates the workflow and ruleset in place.
 

@@ -96,6 +96,7 @@ jobs:
             repository(owner:$owner,name:$name){
               pullRequest(number:$num){
                 headRefOid
+                updatedAt
                 author{login}
                 reviewThreads(first:100){
                   pageInfo{hasNextPage}
@@ -156,7 +157,22 @@ jobs:
                          "-f", "description=" + description[:139],
                          "-f", "target_url=" + run_url]) is not None
 
-          def evaluate(pr):
+          def strictly_newer(before, after):
+              """True only when `after` can be POSITIVELY established as later than `before`.
+
+              Used to decide whether a sweep's snapshot has been overtaken. Any doubt — a parse
+              failure, a missing value, a format surprise — returns False, which means we
+              publish. Defaulting the other way would skip the write and leave a stale status,
+              and stale means green. The safe default here is to write, not to abstain.
+              """
+              try:
+                  from datetime import datetime
+                  fmt = "%Y-%m-%dT%H:%M:%SZ"
+                  return datetime.strptime(after.strip(), fmt) > datetime.strptime(before.strip(), fmt)
+              except Exception:
+                  return False
+
+          def evaluate(pr, sweep=False):
               out = gh(["api", "graphql", "-f", "query=" + QUERY,
                         "-f", "owner=" + owner, "-f", "name=" + name, "-F", "num=%d" % pr])
               if out is None:
@@ -165,6 +181,7 @@ jobs:
 
               data = json.loads(out)["data"]["repository"]["pullRequest"]
               sha = data["headRefOid"]
+              snapshot_at = data["updatedAt"]
               pr_author = (data["author"] or {}).get("login")
               unmet = []
 
@@ -216,6 +233,17 @@ jobs:
                              if unmet else
                              "every reviewer thread replied to, reacted to, and resolved")
 
+              # A sweep evaluates from a snapshot and runs in its own concurrency group, so an
+              # event-triggered run can publish a NEWER verdict while this one is still working.
+              # Writing our older result over it would put the gate back to stale-green. Only
+              # skip when the PR can be POSITIVELY shown to have moved; see strictly_newer.
+              if sweep:
+                  latest = gh(["api", "repos/%s/pulls/%d" % (repo, pr), "--jq", ".updated_at"])
+                  if latest is not None and strictly_newer(snapshot_at, latest):
+                      sys.stderr.write(
+                          "review-gate: PR %d moved during the sweep; deferring to the newer run\n" % pr)
+                      return (pr, sha, "deferred", [])
+
               if not publish(sha, state, description):
                   sys.stderr.write("review-gate: could not publish status for PR %d\n" % pr)
                   return None
@@ -223,24 +251,52 @@ jobs:
               return (pr, sha, state, unmet)
 
           raw = (os.environ.get("PR") or "").strip()
+          sweep = not raw
+          skipped = []
+
           if raw:
               targets = [int(raw)]
           else:
               # --paginate, because an unpaginated first page silently drops PRs 101+ and the
               # count guard below cannot detect an omission it never knew about. A stacked PR
               # off the end of page 1 would keep its stale green forever.
+              default_branch = (gh(["api", "repos/" + repo, "--jq", ".default_branch"]) or "").strip()
               listing = gh(["api", "--paginate", "repos/%s/pulls?state=open&per_page=100" % repo,
-                            "--jq", ".[].number"])
-              if listing is None:
+                            "--jq", r'.[] | "\(.number) \(.base.ref)"'])
+              if listing is None or not default_branch:
                   sys.exit("review-gate: could not list open PRs")
-              targets = [int(n) for n in listing.split()]
+              rows = [ln.split() for ln in listing.splitlines() if ln.strip()]
 
-          results = [r for r in (evaluate(p) for p in targets) if r is not None]
+              # Stacked PRs first. Their review events never fire (see TRIGGER SEMANTICS above),
+              # so this sweep is their ONLY source of a fresh verdict; a PR based on the default
+              # branch that loses its slot still has event coverage.
+              rows.sort(key=lambda r: r[1] == default_branch)
+              targets = [int(r[0]) for r in rows]
+
+              # GITHUB_TOKEN allows ~1000 GraphQL points per repo per hour and this sweep runs 6
+              # times an hour, so past ~150 open PRs the tail would start hitting rate limits and
+              # silently retain stale statuses. Truncate deliberately and LOUDLY instead: no
+              # silent caps, because a cap nobody reports reads as full coverage.
+              BUDGET = 150
+              if len(targets) > BUDGET:
+                  skipped = targets[BUDGET:]
+                  targets = targets[:BUDGET]
+
+          results = [r for r in (evaluate(p, sweep) for p in targets) if r is not None]
 
           lines = ["# review-gate", ""]
+          if skipped:
+              lines += ["> **%d PR(s) were NOT evaluated** — the sweep budget of %d was exceeded, so"
+                        " these retain whatever status they last had: %s"
+                        % (len(skipped), BUDGET, ", ".join("#%d" % p for p in skipped)),
+                        "", "Lower the cron frequency or raise the budget.", ""]
           for pr, sha, state, unmet in results:
               lines.append("## PR #%d @ `%s` — **%s**" % (pr, sha[:7], state))
               lines.append("")
+              if state == "deferred":
+                  lines.append("Moved during the sweep; a newer run owns the verdict.")
+                  lines.append("")
+                  continue
               if unmet:
                   lines.extend("- %s" % u for u in unmet)
                   lines.append("")
@@ -259,4 +315,8 @@ jobs:
           if len(results) != len(targets):
               sys.exit("review-gate: %d of %d PR evaluations failed; their statuses are STALE"
                        % (len(targets) - len(results), len(targets)))
+          if skipped:
+              sys.exit("review-gate: sweep budget %d exceeded; %d PR(s) not evaluated and their "
+                       "statuses are STALE: %s"
+                       % (BUDGET, len(skipped), ", ".join("#%d" % p for p in skipped)))
           PY
