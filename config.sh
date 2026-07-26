@@ -135,6 +135,10 @@ pt_rotate_log() {                        # $1 = log path
   local bytes; bytes=$(wc -c < "$1" 2>/dev/null) || return 0
   (( bytes / 1024 >= PT_LOG_MAX_KB )) || return 0
   mv -f "$1" "$1.1" 2>/dev/null
+  # Recreate it. An ordinary tick writes nothing to these logs — only alerts, policy changes and
+  # gaps do — so without this the active path stays ABSENT until the next such event, and both
+  # `pm status` and `pm logs` (which read only the active file) go blind right after a rotation.
+  : > "$1" 2>/dev/null
 }
 
 # ---------- mode overrides ----------

@@ -43,6 +43,27 @@ notify() {
 }
 mins_for() { print -- $(( ($1 - 1) * WATCHDOG_INTERVAL_SEC / 60 )); }   # elapsed, not observed count
 
+# Anchored identity match — the zsh twin of mem-watchdog's awk ident_match(), against the same
+# lists. Substring-of-the-full-path is not merely imprecise here, it is a kill-safety hole: with
+# `codex` on KILL_ALLOWLIST, `[[ $comm == *codex* ]]` makes /Users/me/.codex/tools/rg permanently
+# exempt from AUTO_KILL in aggressive mode, so a genuine runaway can never be terminated. The
+# same looseness silences real hogs via ALERT_ALLOWLIST (`hidd` matches hidden-daemon, `mds`
+# matches mdsync, `logd` matches logd-shipper).
+#   exact basename                 claude, kernel_task
+#   basename + separator suffix    com.apple.Virtualization.VirtualMachine, mdworker_shared
+#   exact path SEGMENT             /opt/claude/bin/wrapper protected; /Users/me/.codex/... not
+# (Codex round 4 on PR #2. The memory path got this on PR #1; both watchdogs consume the same
+# lists from config.sh, and only one of the two consumers was fixed. Now both.)
+ident_match() {                     # $1 = comm, $2 = space-separated list
+  local comm=$1 b=${1:t} a
+  for a in ${=2}; do
+    [[ $b == $a ]] && return 0
+    [[ $b == ${a}[0-9._-]* ]] && return 0
+    [[ "/$comm/" == *"/$a/"* ]] && return 0
+  done
+  return 1
+}
+
 # Accumulated streaks are only meaningful against the policy that produced them. Switching mode
 # (`pm mode`), editing a threshold, or toggling AGG_ENABLE leaves samples on disk that were
 # gathered under DIFFERENT rules, and they keep counting toward the new window: two samples
@@ -113,14 +134,12 @@ while read -r pid cpu etime comm; do
     AGGCPU[$comm]=$(( ${AGGCPU[$comm]:-0} + cpu ))
     AGGCNT[$comm]=$(( ${AGGCNT[$comm]:-0} + 1 ))
     (( cpu > AGG_MAXPROC )) && AGG_MAXPROC=$cpu
-    for a in ${=ALERT_ALLOWLIST}; do
-      [[ "$comm" == *$a* ]] && { AGG_ALLOWLISTED=$(( AGG_ALLOWLISTED + cpu )); break }
-    done
+    ident_match "$comm" "$ALERT_ALLOWLIST" && AGG_ALLOWLISTED=$(( AGG_ALLOWLISTED + cpu ))
   fi
 
   (( cpu >= CPU_THRESHOLD )) || continue
   kill -0 "$pid" 2>/dev/null || continue
-  for a in ${=ALERT_ALLOWLIST}; do [[ "$comm" == *$a* ]] && continue 2; done   # skip expected daemons
+  ident_match "$comm" "$ALERT_ALLOWLIST" && continue                          # skip expected daemons
 
   # PID REUSE: a PID is unique only among LIVE processes. macOS recycles them, so keying the
   # streak on the PID alone lets a fresh process inherit a dead one's hotcount and cross
@@ -160,9 +179,8 @@ while read -r pid cpu etime comm; do
     notify "⚠️ Runaway CPU process" "$msg"
     noted=$count
     if (( AUTO_KILL )); then
-      skip=0
-      for a in ${=KILL_ALLOWLIST}; do [[ "$comm" == *$a* ]] && skip=1; done
-      (( skip )) || { kill -TERM "$pid" 2>/dev/null && print -- "$(ts) KILLED $msg" >> "$LOG"; }
+      ident_match "$comm" "$KILL_ALLOWLIST" \
+        || { kill -TERM "$pid" 2>/dev/null && print -- "$(ts) KILLED $msg" >> "$LOG"; }
     fi
   fi
   printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$count" "$noted" "$comm" "$start" >> "$STATE.tmp"
@@ -177,11 +195,12 @@ mv "$STATE.tmp" "$STATE"
 # no kill path here — an aggregate signal identifies that the system is saturated but not WHO is
 # saturating it, and blame is a precondition for termination (brief 0002, GOAL_CONTRACT §4).
 if (( AGG_ENABLE )); then
-  agg_streak=0; agg_noted=0
+  agg_streak=0; agg_noted=0; agg_supp=0
   if [[ -f "$AGG_STATE" ]]; then
-    IFS=$'\t' read -r agg_streak agg_noted agg_last < "$AGG_STATE"   # 3rd field or agg_noted eats it
-    [[ -n "$agg_streak" ]] || agg_streak=0
-    [[ -n "$agg_noted" ]] || agg_noted=0
+    IFS=$'\t' read -r agg_streak agg_noted agg_last agg_supp < "$AGG_STATE"
+    [[ "$agg_streak" == <-> ]] || agg_streak=0
+    [[ "$agg_noted"  == <-> ]] || agg_noted=0
+    [[ "$agg_supp"   == <-> ]] || agg_supp=0
   fi
 
   ncpu=$(sysctl -n hw.ncpu 2>/dev/null || print 1); (( ncpu > 0 )) || ncpu=1
@@ -194,9 +213,22 @@ if (( AGG_ENABLE )); then
 
   if (( per_core >= AGG_LOAD_PER_CORE )); then
     agg_streak=$(( agg_streak + 1 ))
+
+    # Is this tick's aggregate signal SUPPRESSED — a named per-process culprit already reported,
+    # or the load mostly attributable to ALERT_ALLOWLIST batch work? Computed BEFORE the due
+    # test, because a suppressed->unsuppressed transition must itself be due. Otherwise the
+    # suppressing workload vanishing while a real distributed runaway continues would wait out
+    # AGG_RENOTIFY_EVERY: 60 min in balanced mode, 40 in aggressive. (Codex round 4 on PR #2.)
+    agg_allow_pct=0
+    (( AGG_TOTAL > 0 )) && agg_allow_pct=$(( 100 * AGG_ALLOWLISTED / AGG_TOTAL ))
+    suppress_now=0
+    (( AGG_PERPROC_FIRED )) && suppress_now=1
+    (( agg_allow_pct >= AGG_ALLOWLIST_PCT )) && suppress_now=1
+
     agg_due=0
     if (( agg_streak == AGG_SUSTAIN_CHECKS )); then agg_due=1
     elif (( agg_streak > AGG_SUSTAIN_CHECKS && agg_streak - agg_noted >= AGG_RENOTIFY_EVERY )); then agg_due=1
+    elif (( agg_streak > AGG_SUSTAIN_CHECKS && agg_supp && ! suppress_now )); then agg_due=1
     fi
 
     if (( agg_due )); then
@@ -212,9 +244,6 @@ if (( AGG_ENABLE )); then
       # AGG-DISTRIBUTED "runaway" — defeating the allowlist for exactly the multi-process batch
       # jobs this gate observes. If most of the load is attributable to allowlisted daemons, log
       # it and stay quiet. (Codex round 3 on PR #2.)
-      agg_allow_pct=0
-      (( AGG_TOTAL > 0 )) && agg_allow_pct=$(( 100 * AGG_ALLOWLISTED / AGG_TOTAL ))
-
       if (( AGG_PERPROC_FIRED )); then
         # A per-process alert already named a culprit this tick; log only, don't double-notify.
         print -- "$(ts) AGG    $msg" >> "$LOG"
@@ -225,10 +254,12 @@ if (( AGG_ENABLE )); then
         print -- "$(ts) AGG-DISTRIBUTED  $msg" >> "$LOG"
         notify "⚠️ Distributed CPU runaway" "No single process is hot — $msg"
       fi
-      agg_noted=$agg_streak
+      # Only a tick that ACTUALLY NOTIFIED consumes the notification slot. A suppressed tick
+      # leaves agg_noted alone, so the renotify clock is not spent on an alert nobody received.
+      (( suppress_now )) || agg_noted=$agg_streak
     fi
   else
-    agg_streak=0; agg_noted=0
+    agg_streak=0; agg_noted=0; suppress_now=0
   fi
-  printf '%s\t%s\t%s\n' "$agg_streak" "$agg_noted" "$EPOCHSECONDS" > "$AGG_STATE"
+  printf '%s\t%s\t%s\t%s\n' "$agg_streak" "$agg_noted" "$EPOCHSECONDS" "${suppress_now:-0}" > "$AGG_STATE"
 fi
