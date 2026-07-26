@@ -8,6 +8,7 @@ PT_ROOT=${0:A:h:h}; source "$PT_ROOT/config.sh"
 zmodload zsh/datetime 2>/dev/null
 mkdir -p "$PT_LOG"
 STATE="$PT_VAR/cpu-state.tsv"            # pid \t hotcount \t notedcount \t comm
+AGG_STATE="$PT_VAR/cpu-agg-state"        # streak \t noted
 LOG="$PT_LOG/watchdog.log"
 
 # N observations spaced WATCHDOG_INTERVAL_SEC apart span (N-1)*interval of ELAPSED time, not
@@ -25,8 +26,35 @@ sustain_checks $SUSTAIN_MIN; SUSTAIN_CHECKS=$REPLY
 RENOTIFY_EVERY=$(( SUSTAIN_CHECKS * 4 ))
 
 ts() { strftime '%Y-%m-%d %H:%M:%S' $EPOCHSECONDS; }
-notify() { osascript -e "display notification \"$2\" with title \"$1\" sound name \"Submarine\"" >/dev/null 2>&1; }
+# $1 title, $2 body. BOTH may embed a process name taken from `ps -o comm`, and any user can
+# name an executable `foo"bar` or `foo\bar`. Unescaped, that terminates the AppleScript string
+# literal and osascript fails to parse — and since its output is discarded, the notification is
+# lost SILENTLY, precisely in the runaway case this exists to report. Backslash first, then
+# quote, or the escapes escape each other. (Codex round 2 on PR #2 — flagged at the aggregate
+# call site; fixed here because both call sites pass `comm`-derived text.)
+notify() {
+  local t=${1//\\/\\\\} b=${2//\\/\\\\}
+  t=${t//\"/\\\"}; b=${b//\"/\\\"}
+  osascript -e "display notification \"$b\" with title \"$t\" sound name \"Submarine\"" >/dev/null 2>&1
+}
 mins_for() { print -- $(( ($1 - 1) * WATCHDOG_INTERVAL_SEC / 60 )); }   # elapsed, not observed count
+
+# Accumulated streaks are only meaningful against the policy that produced them. Switching mode
+# (`pm mode`), editing a threshold, or toggling AGG_ENABLE leaves samples on disk that were
+# gathered under DIFFERENT rules, and they keep counting toward the new window: two samples
+# above aggressive's 2.0/core could carry into balanced and let the first 2.5/core sample alert
+# immediately, despite balanced advertising ten sustained minutes. Fingerprint the policy and
+# discard BOTH state files when it changes — the per-process state has the identical defect
+# (HOT counts survive a CPU_THRESHOLD or SUSTAIN_MIN edit), so one mechanism covers the class.
+# (Codex round 2 on PR #2, flagged for the aggregate state only.)
+POLICY_FILE="$PT_VAR/cpu-policy"
+POLICY="v1|$WATCHDOG_INTERVAL_SEC|$CPU_THRESHOLD|$SUSTAIN_MIN|$AGG_ENABLE|$AGG_LOAD_PER_CORE|$AGG_SUSTAIN_MIN|$AGG_MIN_PROC_CPU"
+if [[ "$(cat "$POLICY_FILE" 2>/dev/null)" != "$POLICY" ]]; then
+  [[ -f "$STATE" || -f "$AGG_STATE" ]] && \
+    print -- "$(ts) POLICY change — discarding accumulated streaks ($POLICY)" >> "$LOG"
+  rm -f "$STATE" "$AGG_STATE"
+  print -- "$POLICY" > "$POLICY_FILE"
+fi
 
 typeset -A HOT NOTED
 if [[ -f "$STATE" ]]; then
@@ -97,7 +125,6 @@ mv "$STATE.tmp" "$STATE"
 # no kill path here — an aggregate signal identifies that the system is saturated but not WHO is
 # saturating it, and blame is a precondition for termination (brief 0002, GOAL_CONTRACT §4).
 if (( AGG_ENABLE )); then
-  AGG_STATE="$PT_VAR/cpu-agg-state"          # streak \t noted
   agg_streak=0; agg_noted=0
   if [[ -f "$AGG_STATE" ]]; then
     IFS=$'\t' read -r agg_streak agg_noted < "$AGG_STATE"
