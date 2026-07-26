@@ -17,7 +17,7 @@ mkdir -p "$PT_LOG"
 # Paths honor optional MEM_*_OVERRIDE env (unset in production / launchd) so the test harness
 # can run in full isolation without touching the live observe-soak log or state.
 LOG="${MEM_LOG_OVERRIDE:-$PT_LOG/mem-watchdog.log}"
-STATE="${MEM_STATE_OVERRIDE:-$PT_VAR/mem-state.tsv}"   # pid \t rss_kb \t first_seen \t last_seen \t streak
+STATE="${MEM_STATE_OVERRIDE:-$PT_VAR/mem-state.tsv}"   # pid \t rss_kb \t first_seen \t last_seen \t streak \t start
 SWAPLAST="${MEM_SWAPLAST_OVERRIDE:-$PT_VAR/mem-swap-last}"   # last swap-used (MB), for the growth delta
 
 ts() { strftime '%Y-%m-%d %H:%M:%S' $EPOCHSECONDS; }
@@ -49,7 +49,10 @@ if (( $(rank $pband) > $(rank $band) )); then headroom=$pband; else headroom=$ba
 # verified deterministically without inducing real memory pressure. See goal/tools/test-decision.sh.
 [[ -n "${MEM_FORCE_HEADROOM:-}" ]] && headroom="$MEM_FORCE_HEADROOM"
 [[ -n "${MEM_TOPN_OVERRIDE:-}" ]] && MEM_TOP_N="$MEM_TOPN_OVERRIDE"   # test-only: raise display cap
-if [[ -n "${MEM_PS_SOURCE:-}" && -r "${MEM_PS_SOURCE}" ]]; then ps_cmd=(cat "$MEM_PS_SOURCE"); else ps_cmd=(ps -axo pid=,rss=,comm=); fi
+# etime is here so that process IDENTITY, not just the PID, keys the history below. It costs
+# nothing: same single `ps`, one extra column, placed before comm because comm may contain
+# spaces and must stay last.
+if [[ -n "${MEM_PS_SOURCE:-}" && -r "${MEM_PS_SOURCE}" ]]; then ps_cmd=(cat "$MEM_PS_SOURCE"); else ps_cmd=(ps -axo pid=,rss=,etime=,comm=); fi
 
 NOW=$EPOCHSECONDS
 : > "$STATE.tmp"
@@ -82,20 +85,43 @@ NOW=$EPOCHSECONDS
     if (base_match(b, EPHEM)) return "ephemeral"
     return "unknown"
   }
+  # ps etime -> seconds. Formats: SS, MM:SS, HH:MM:SS, DD-HH:MM:SS.
+  function etime_sec(e,   n,p,t,d,s) {
+    d=0; n=split(e,p,"-"); if(n==2){ d=p[1]+0; e=p[2] }
+    n=split(e,t,":")
+    if(n==3) s=t[1]*3600+t[2]*60+t[3]; else if(n==2) s=t[1]*60+t[2]; else s=e+0
+    return d*86400+s
+  }
   function tol_of(p)  { if(p=="system")return SYS_TOL; if(p=="trusted")return TRU_TOL; if(p=="devruntime")return DEV_TOL; if(p=="ephemeral")return EPH_TOL; return UNK_TOL }
   function base_of(p) { if(p=="system")return SYS_BASE;if(p=="trusted")return TRU_BASE;if(p=="devruntime")return DEV_BASE;if(p=="ephemeral")return EPH_BASE;return UNK_BASE }
   BEGIN {
     while ((getline line < STATEIN) > 0) {
       nf = split(line, f, "\t")
-      if (nf >= 4) { prss[f[1]]=f[2]; fseen[f[1]]=f[3]; lseen[f[1]]=f[4]; streak[f[1]]=(nf>=5?f[5]:0) }
+      # 6th field is the process START epoch. Rows written before it existed have nf<6 and get
+      # start=-1, which never matches, so one tick of history is discarded on upgrade.
+      if (nf >= 4) { prss[f[1]]=f[2]; fseen[f[1]]=f[3]; lseen[f[1]]=f[4]; streak[f[1]]=(nf>=5?f[5]:0); pstart[f[1]]=(nf>=6?f[6]:-1) }
     }
     close(STATEIN)
     nflag = 0; maxrisk = -1; maxcomm = "-"; nproc = 0
   }
   {
-    pid=$1; rss_kb=$2; comm=$3; for(i=4;i<=NF;i++) comm=comm" "$i
+    pid=$1; rss_kb=$2; etime=$3; comm=$4; for(i=5;i<=NF;i++) comm=comm" "$i
     if (pid=="" || rss_kb=="") next
     nproc++
+    # PID REUSE: a PID is only unique among LIVE processes. macOS recycles them, and keying
+    # history on the PID alone lets a brand-new process inherit the dead RSS, last_seen and
+    # growth streak — so it can be judged as having sustained growth on its very first tick.
+    # Harmless while M0 only logs; it becomes a wrong kill the moment M1 acts on that evidence.
+    # Identity is therefore (pid, start). start is derived from etime rather than read per
+    # process, so the one-ps-per-tick budget is unchanged. A 5s tolerance absorbs the
+    # one-second etime resolution and the drift between the ps snapshot and NOW; PIDs are not
+    # reused within seconds on a machine with 100k of them to cycle through first.
+    start = NOW - etime_sec(etime)
+    if (pid in pstart) {
+      d = start - pstart[pid]; if (d < 0) d = -d
+      if (d > 5) { delete prss[pid]; delete fseen[pid]; delete lseen[pid]; delete streak[pid] }
+      else start = pstart[pid]   # keep the first-seen value so it cannot drift tick by tick
+    }
     # basename
     b=comm; m=comm; while ((p=index(m,"/"))>0) { m=substr(m,p+1) } b=m
     rss_mb = rss_kb/1024.0
@@ -112,9 +138,9 @@ NOW=$EPOCHSECONDS
     # sustained-growth streak (D-008): a single noisy burst tick never reaches an action.
     grewnow = (growth >= GROWTH_MIN) ? 1 : 0
     st = (grewnow ? (((pid in streak) ? streak[pid] : 0) + 1) : 0)
-    # new state (5 fields: + grow streak)
+    # new state (6 fields: + grow streak + process start, the identity guard)
     f0 = (pid in fseen) ? fseen[pid] : NOW
-    printf "%s\t%d\t%s\t%s\t%d\n", pid, rss_kb, f0, NOW, st > STATEOUT
+    printf "%s\t%d\t%s\t%s\t%d\t%d\n", pid, rss_kb, f0, NOW, st, start > STATEOUT
     # would-be action (M0 never acts; this is the decision it WOULD make)
     # action-eligible only when growth has SUSTAINED, or RSS is already a runaway multiple of baseline
     eligible = (st >= SUSTAIN || ratio >= RATIO_HARD) ? 1 : 0
