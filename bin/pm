@@ -112,6 +112,10 @@ cmd_apply() {
   reload_agent "$WATCHDOG_LABEL" "$p"; c_green "  agent  $WATCHDOG_LABEL (every ${WATCHDOG_INTERVAL_SEC}s)"
   p=$(gen_plist "$SAVER_LABEL" "$SAVER_INTERVAL_SEC" "$PT_ROOT/libexec/power-saver.sh" "tick")
   reload_agent "$SAVER_LABEL" "$p"; c_green "  agent  $SAVER_LABEL (every ${SAVER_INTERVAL_SEC}s)"
+  p=$(gen_plist "$MEM_WATCHDOG_LABEL" "$MEM_WATCHDOG_INTERVAL_SEC" "$PT_ROOT/libexec/mem-watchdog.sh")
+  reload_agent "$MEM_WATCHDOG_LABEL" "$p"
+  (( MEM_OBSERVE )) && c_green "  agent  $MEM_WATCHDOG_LABEL (every ${MEM_WATCHDOG_INTERVAL_SEC}s, OBSERVE — no kills)" \
+                    || c_green "  agent  $MEM_WATCHDOG_LABEL (every ${MEM_WATCHDOG_INTERVAL_SEC}s)"
 
   if [[ -n "$SLEEPWATCHER" ]]; then
     p=$(gen_plist "$SLEEPWATCHER_LABEL" 0 "$SLEEPWATCHER" "-s" "$PT_ROOT/libexec/on-sleep" "-w" "$PT_ROOT/libexec/on-wake")
@@ -143,7 +147,7 @@ cmd_install() {
 }
 
 cmd_uninstall() {
-  for l in "$WATCHDOG_LABEL" "$SAVER_LABEL" "$SLEEPWATCHER_LABEL"; do
+  for l in "$WATCHDOG_LABEL" "$SAVER_LABEL" "$SLEEPWATCHER_LABEL" "$MEM_WATCHDOG_LABEL"; do
     launchctl bootout "$GUI/$l" 2>/dev/null
     rm -f "$AGENTS_DIR/$l.plist"
     c_dim "  removed $l"
@@ -184,7 +188,8 @@ cmd_status() {
   print -n -- "  Power   "; battery_bar ${pctn:-0}
   print -- " ${pct}  ${dir} ${w}W  ·  $src  ·  lid $lid  ·  bt $bt"
   print; print -- "  Agents"
-  print -n  "    watchdog       "; agent_state "$WATCHDOG_LABEL"
+  print -n  "    cpu-watchdog   "; agent_state "$WATCHDOG_LABEL"
+  print -n  "    mem-watchdog   "; agent_state "$MEM_WATCHDOG_LABEL"; (( MEM_OBSERVE )) && c_dim "      (observe mode — logs would-be actions, no kills)"
   print -n  "    power-saver    "; agent_state "$SAVER_LABEL"
   print -n  "    sleepwatcher   "; [[ -n "$SLEEPWATCHER" ]] && agent_state "$SLEEPWATCHER_LABEL" || c_red "not installed"
   print; print -- "  pmset (desired → actual)"
@@ -197,7 +202,17 @@ cmd_status() {
   done
   print; print -- "  Top CPU"
   ps -arcwwwxo pid=,%cpu=,comm= | head -3 | sed 's/^/    /'
-  print; print -- "  Recent watchdog alerts"
+  print; print -- "  Memory headroom"
+  if [[ -s "$PT_LOG/mem-watchdog.log" ]]; then
+    grep ' TICK ' "$PT_LOG/mem-watchdog.log" | tail -1 | sed 's/^/    /'
+  else c_dim "    (mem-watchdog has not ticked yet)"; fi
+  print; print -- "  Top RSS"
+  ps -axo rss=,comm= | sort -rn | head -3 | awk '{printf "    %6.0fM  ", $1/1024; $1=""; print}'
+  print; print -- "  Recent mem would-actions"
+  if [[ -s "$PT_LOG/mem-watchdog.log" ]] && grep -qE 'WOULD-' "$PT_LOG/mem-watchdog.log"; then
+    grep -E 'WOULD-' "$PT_LOG/mem-watchdog.log" | tail -3 | sed 's/^/    /'
+  else c_dim "    (none)"; fi
+  print; print -- "  Recent cpu-watchdog alerts"
   if [[ -s "$PT_LOG/watchdog.log" ]]; then tail -3 "$PT_LOG/watchdog.log" | sed 's/^/    /'; else c_dim "    (none)"; fi
   bar
 }
@@ -208,7 +223,8 @@ cmd_doctor() {
   bar; print -- "  pm doctor"; bar
   chk "blueutil installed"        '[[ -n "$BLUEUTIL" ]]'        "brew install blueutil"
   chk "sleepwatcher installed"    '[[ -n "$SLEEPWATCHER" ]]'    "brew install sleepwatcher"
-  chk "watchdog agent loaded"     'launchctl print "$GUI/$WATCHDOG_LABEL" >/dev/null 2>&1' "pm apply"
+  chk "cpu-watchdog agent loaded" 'launchctl print "$GUI/$WATCHDOG_LABEL" >/dev/null 2>&1' "pm apply"
+  chk "mem-watchdog agent loaded" 'launchctl print "$GUI/$MEM_WATCHDOG_LABEL" >/dev/null 2>&1' "pm apply"
   chk "saver agent loaded"        'launchctl print "$GUI/$SAVER_LABEL" >/dev/null 2>&1'    "pm apply"
   chk "sleep/wake hooks loaded"   'launchctl print "$GUI/$SLEEPWATCHER_LABEL" >/dev/null 2>&1' "pm apply"
   chk "clamshell state readable"  'ioreg -r -k AppleClamshellState 2>/dev/null | grep -q AppleClamshellState' "macOS API changed?"
@@ -231,8 +247,10 @@ cmd_mode() {
 cmd_logs() {
   case "${1:-all}" in
     watchdog) tail -n 30 -f "$PT_LOG/watchdog.log" ;;
+    mem)      tail -n 30 -f "$PT_LOG/mem-watchdog.log" ;;
     saver)    tail -n 30 -f "$PT_LOG/saver.log" ;;
-    *)        print -- "== watchdog =="; tail -n 15 "$PT_LOG/watchdog.log" 2>/dev/null
+    *)        print -- "== cpu-watchdog =="; tail -n 15 "$PT_LOG/watchdog.log" 2>/dev/null
+              print -- "== mem-watchdog =="; tail -n 15 "$PT_LOG/mem-watchdog.log" 2>/dev/null
               print -- "== saver =="; tail -n 15 "$PT_LOG/saver.log" 2>/dev/null ;;
   esac
 }
@@ -252,5 +270,5 @@ case "${1:-status}" in
   pm uninstall         remove agents/hooks, re-enable Bluetooth
   pm doctor            health check
   pm mode [name]       balanced | aggressive | conservative
-  pm logs [watchdog|saver]" ;;
+  pm logs [watchdog|mem|saver]" ;;
 esac
