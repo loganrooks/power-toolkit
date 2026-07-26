@@ -77,9 +77,34 @@ The workflow job exits 0 even when obligations are unmet — the verdict lives i
 `review-gate` **commit status**, which is what the ruleset requires. One red thing, not two.
 Read the run's step summary for the itemised list of what is outstanding.
 
-**Known limit:** the GraphQL query takes the first 100 threads / reviews / comments. If a PR
-exceeds that, the gate *fails* rather than passing on partial data. An unseen thread must
-never read as a satisfied one.
+### The invariant: every quiet failure is a fail-open
+
+A required status that is not freshly written **keeps its previous value**, and that value is
+`success` in every case that matters — a PR is green at open time, before any reviewer has
+commented. So every way this workflow can fail quietly makes the PR mergeable with unanswered
+findings.
+
+Codex round 1 on PR #3 found **four independent instances of that one shape**, which is why
+the rule is written down rather than left implicit:
+
+| Instance | Why it went green |
+|---|---|
+| Status publish failure was ignored | evaluation "succeeded", stale status retained |
+| PR listing was unpaginated | PRs 101+ never evaluated, and the count guard could not miss what it never listed |
+| Commit-status quota | 1000 per SHA per context; a `*/10` sweep republishing an unchanged verdict burns 144/day and exhausts it in under 7 days — after which a green SHA **can never be turned red** |
+| GraphQL 100-item window | threads past the window unseen |
+
+**The rule for anyone editing this workflow:** any condition that prevents establishing *or*
+publishing a verdict must make the run loud — a `failure` status where there is a SHA to write
+to, a non-zero exit otherwise. Never `pass`, never a bare `except`, never a partial sweep
+reported as success.
+
+The quota fix is why `publish()` skips writing when the current status already carries the
+same state. That dedupe is a correctness requirement, not an optimisation.
+
+**Residual risk, not closed:** if the statuses API itself is unavailable, a green SHA cannot be
+turned red at all. The run fails visibly and the next sweep retries, so exposure is bounded by
+API availability — but it is real and is not engineered away.
 
 ## Applying these gates to another repo
 
@@ -89,6 +114,14 @@ CHECKS='build,test' .github/scripts/bootstrap-review-gates.sh owner/other-repo  
 ```
 
 Idempotent: re-running updates the workflow and ruleset in place.
+
+**Upgrading a repo that already has the gate takes two runs.** The ruleset makes the default
+branch require a PR with no bypass actors, so the script's own direct commit is rejected — the
+upgrade path is blocked by exactly the thing it installed. It therefore falls back to a branch
+plus a PR, and then **stops without touching the ruleset**: requiring the `review-gate` check
+while the workflow sits in an unmerged PR would block every pull request on a check that can
+never report, which is the fail-closed mirror of the bug above. Merge the PR it opens, re-run,
+and the ruleset step completes.
 
 **The script cannot install the reviewer bots.** Codex and CodeRabbit are GitHub Apps
 configured from their own dashboards, and neither exposes an installation API. So

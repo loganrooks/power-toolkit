@@ -32,24 +32,53 @@ REMOTE_PATH=.github/workflows/review-gate.yml
 EXISTING_SHA=$(gh api "repos/$TARGET/contents/$REMOTE_PATH?ref=$DEFAULT_BRANCH" --jq .sha 2>/dev/null || true)
 LOCAL_B64=$(base64 < "$WORKFLOW" | tr -d '\n')
 
-if [[ -n "$EXISTING_SHA" ]]; then
+REMOTE_B64=""
+[[ -n "$EXISTING_SHA" ]] && \
   REMOTE_B64=$(gh api "repos/$TARGET/contents/$REMOTE_PATH?ref=$DEFAULT_BRANCH" --jq .content | tr -d '\n')
-  if [[ "$REMOTE_B64" == "$LOCAL_B64" ]]; then
-    echo "    workflow: already current"
-  else
-    gh api -X PUT "repos/$TARGET/contents/$REMOTE_PATH" \
-      -f message='ci: update review-gate workflow' \
-      -f content="$LOCAL_B64" -f sha="$EXISTING_SHA" -f branch="$DEFAULT_BRANCH" >/dev/null
-    echo "    workflow: updated"
-  fi
+
+# The ruleset this script installs makes the default branch require a pull request with no
+# bypass actors — so on any repo that ALREADY has the gate, a direct Contents-API commit is
+# rejected and the "idempotent upgrade" cannot deliver a fix to precisely the installations
+# running the old, broken gate. Try direct; fall back to a branch and a PR.
+# (Codex round 1 on PR #3.)
+put_file() {                       # $1 = branch, $2 = commit message
+  local args=(-X PUT "repos/$TARGET/contents/$REMOTE_PATH"
+              -f "message=$2" -f "content=$LOCAL_B64" -f "branch=$1")
+  [[ -n "$EXISTING_SHA" ]] && args+=(-f "sha=$EXISTING_SHA")
+  gh api "${args[@]}" >/dev/null 2>&1
+}
+
+if [[ -n "$EXISTING_SHA" ]]; then MSG='ci: update review-gate workflow'
+else                              MSG='ci: add review-gate workflow'; fi
+
+if [[ -n "$EXISTING_SHA" && "$REMOTE_B64" == "$LOCAL_B64" ]]; then
+  echo "    workflow: already current"
+elif put_file "$DEFAULT_BRANCH" "$MSG"; then
+  echo "    workflow: written to $DEFAULT_BRANCH"
 else
-  gh api -X PUT "repos/$TARGET/contents/$REMOTE_PATH" \
-    -f message='ci: add review-gate workflow' \
-    -f content="$LOCAL_B64" -f branch="$DEFAULT_BRANCH" >/dev/null
-  echo "    workflow: created"
+  BR=chore/review-gate-bootstrap
+  HEAD_SHA=$(gh api "repos/$TARGET/git/ref/heads/$DEFAULT_BRANCH" --jq .object.sha)
+  gh api -X POST "repos/$TARGET/git/refs" -f "ref=refs/heads/$BR" -f "sha=$HEAD_SHA" >/dev/null 2>&1 || true
+  EXISTING_SHA=$(gh api "repos/$TARGET/contents/$REMOTE_PATH?ref=$BR" --jq .sha 2>/dev/null || true)
+  put_file "$BR" "$MSG" || { echo "    workflow: FAILED on both $DEFAULT_BRANCH and $BR" >&2; exit 1; }
+  PR_URL=$(gh pr create --repo "$TARGET" --base "$DEFAULT_BRANCH" --head "$BR" --title "$MSG" \
+             --body 'Automated `review-gate` bootstrap. The default branch is protected by the gate ruleset, so this could not be committed directly.' 2>/dev/null \
+           || gh pr list --repo "$TARGET" --head "$BR" --state open --json url --jq '.[0].url')
+  WORKFLOW_PENDING=1
+  echo "    workflow: $DEFAULT_BRANCH is protected -> opened $PR_URL"
 fi
 
 # ---- 2. the ruleset ----------------------------------------------------------------------
+# Applying a ruleset that REQUIRES the `review-gate` check while the workflow is still sitting
+# in an unmerged PR would block every pull request on a check that can never report — the
+# fail-CLOSED mirror of the fail-open this whole workflow is about. Refuse, and say what to do.
+if [[ -n "${WORKFLOW_PENDING:-}" ]]; then
+  echo "==> ruleset NOT applied: the workflow is still in an unmerged PR."
+  echo '    Requiring the review-gate check now would block every PR on a check that cannot run.'
+  echo "    Merge $PR_URL, then re-run this script to apply the ruleset."
+  exit 0
+fi
+
 # CHECKS lets a repo with different CI job names reuse this without editing the JSON.
 PAYLOAD=$(cat "$RULESET")
 if [[ -n "${CHECKS:-}" ]]; then

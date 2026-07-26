@@ -26,6 +26,21 @@ name: review-gate
 #
 # Nothing from the head branch is ever checked out or executed: this job reads PR metadata
 # and writes a commit status.
+#
+# THE INVARIANT — read this before editing anything below.
+#   A required status that is not freshly written KEEPS ITS PREVIOUS VALUE, and the previous
+#   value is `success` in every case that matters, because a PR is green at open time before
+#   any reviewer has commented. So EVERY way this workflow can fail quietly is a fail-OPEN:
+#   the PR becomes mergeable with unanswered findings. Codex round 1 on PR #3 found four
+#   independent instances of that one shape — an ignored status-publish failure, an
+#   unpaginated PR listing, commit-status quota exhaustion, and the 100-item GraphQL window.
+#
+#   Therefore: any condition that prevents us from establishing OR publishing a verdict must
+#   make the run LOUD — a `failure` status where we have a SHA to write to, a non-zero exit
+#   otherwise. Never `pass`, never a bare `except`, never a partial sweep reported as success.
+#   Residual risk that is NOT closed: if the statuses API itself is unavailable we cannot turn
+#   a green SHA red at all. The run fails visibly and the next sweep retries, so the exposure
+#   is bounded by API availability, but it is real and is not engineered away.
 
 on:
   pull_request_target:
@@ -121,6 +136,26 @@ jobs:
           def login(node):
               return ((node or {}).get("author") or {}).get("login")
 
+          def publish(sha, state, description):
+              """Write the verdict, unless an identical one is already the current status.
+
+              The dedupe is not an optimisation. GitHub caps commit statuses at 1000 per SHA
+              per context; a */10 sweep republishing an unchanged verdict burns 144/day and
+              exhausts that in under seven days, after which a SHA that is currently GREEN can
+              never be turned red — the exact fail-open this workflow exists to prevent.
+              The combined-status endpoint returns only the latest status per context, so
+              comparing against it is sound.
+              """
+              current = gh(["api", "repos/%s/commits/%s/status" % (repo, sha),
+                            "--jq", '[.statuses[] | select(.context=="review-gate")][0].state // ""'])
+              if current is not None and current.strip() == state:
+                  return True
+              return gh(["api", "repos/%s/statuses/%s" % (repo, sha),
+                         "-f", "state=" + state,
+                         "-f", "context=review-gate",
+                         "-f", "description=" + description[:139],
+                         "-f", "target_url=" + run_url]) is not None
+
           def evaluate(pr):
               out = gh(["api", "graphql", "-f", "query=" + QUERY,
                         "-f", "owner=" + owner, "-f", "name=" + name, "-F", "num=%d" % pr])
@@ -181,11 +216,9 @@ jobs:
                              if unmet else
                              "every reviewer thread replied to, reacted to, and resolved")
 
-              gh(["api", "repos/%s/statuses/%s" % (repo, sha),
-                  "-f", "state=" + state,
-                  "-f", "context=review-gate",
-                  "-f", "description=" + description[:139],
-                  "-f", "target_url=" + run_url])
+              if not publish(sha, state, description):
+                  sys.stderr.write("review-gate: could not publish status for PR %d\n" % pr)
+                  return None
 
               return (pr, sha, state, unmet)
 
@@ -193,11 +226,14 @@ jobs:
           if raw:
               targets = [int(raw)]
           else:
-              listing = gh(["api", "repos/%s/pulls?state=open&per_page=100" % repo,
-                            "--jq", "[.[].number]"])
+              # --paginate, because an unpaginated first page silently drops PRs 101+ and the
+              # count guard below cannot detect an omission it never knew about. A stacked PR
+              # off the end of page 1 would keep its stale green forever.
+              listing = gh(["api", "--paginate", "repos/%s/pulls?state=open&per_page=100" % repo,
+                            "--jq", ".[].number"])
               if listing is None:
                   sys.exit("review-gate: could not list open PRs")
-              targets = json.loads(listing)
+              targets = [int(n) for n in listing.split()]
 
           results = [r for r in (evaluate(p) for p in targets) if r is not None]
 
