@@ -218,7 +218,19 @@ config.sh        single source of truth — thresholds, policies, pmset state, m
 bin/pm           the CLI
 libexec/         cpu-watchdog.sh  mem-watchdog.sh  power-saver.sh  on-sleep  on-wake
 var/             state + logs (gitignored)
+docs/            review-gates.md — the PR review gates and how to reuse them
+.github/         lint + review-gate workflows, ruleset, bootstrap script
 ```
+
+---
+
+## Contributing
+
+Pull requests are gated on more than CI. Every reviewer thread — from a bot or a human —
+must be **replied to, reacted to, and resolved** before merge; a rejection with reasons is
+a fine outcome, a silent resolve is not. The mechanics, the `review-verdict` block format,
+and a one-command script to apply the same gates to another repo are in
+[`docs/review-gates.md`](docs/review-gates.md).
 
 ---
 

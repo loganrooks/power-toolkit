@@ -118,6 +118,21 @@ PMSET_DESIRED=(
   "c powernap 1"
 )
 
+# ---------- log rotation — shared by BOTH watchdogs ----------
+# The agents run indefinitely and append every tick, with no bound. Measured 2026-07-26:
+# var/log/mem-watchdog.log had reached 4.3 MB in roughly five weeks of observe mode (~45 MB/yr),
+# and `pm status` greps these files on every invocation, so they get slower as they grow.
+# Defined here rather than in either watchdog because both have the defect and a second copy is
+# a second thing to drift (the KILL_ALLOWLIST lesson).
+PT_LOG_MAX_KB=${PT_LOG_MAX_KB:-5120}     # rotate past this size; one .1 generation is kept,
+                                         # so worst case on disk is 2x this per log.
+pt_rotate_log() {                        # $1 = log path
+  [[ -f "$1" ]] || return 0
+  local bytes; bytes=$(wc -c < "$1" 2>/dev/null) || return 0
+  (( bytes / 1024 >= PT_LOG_MAX_KB )) || return 0
+  mv -f "$1" "$1.1" 2>/dev/null
+}
+
 # ---------- mode overrides ----------
 case "$PT_MODE" in
   aggressive)
